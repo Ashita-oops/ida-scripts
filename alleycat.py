@@ -660,10 +660,6 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.cmd_toggle_highlight = None
         self.cmd_toggle_focus_on_click = None
         
-        # To register hotkeys related to this
-        # graph.
-        self.hotkey_func_ids = defaultdict(list)
-        
     def add_command(self, title, shortcut):
         cmd_id = self.AddCommand(title, shortcut)
         return cmd_id
@@ -941,10 +937,6 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self._focus_on_node(node_id)
 
     def OnClose(self):
-        for hotkey in self.hotkey_func_ids:
-            for func_id in self.hotkey_func_ids[hotkey]:
-                AlleyCatHotkey.delfunc(hotkey, func_id)
-        
         self.toggle_highlight_all(highlight=False)
 
     def _match_xref_source(self, xref, source):
@@ -1412,9 +1404,6 @@ class idapathfinder_t(idaapi.plugin_t):
         add_to_namespace(
             '__main__', 'alleycat', 'AlleyCatUtils',
             AlleyCatUtils)
-        add_to_namespace(
-            '__main__', 'alleycat', 'AlleyCatHotkey',
-            AlleyCatHotkey)
         add_to_namespace(
             '__main__', 'alleycat', 'AlleyCatFunctionXrefs',
             AlleyCatFunctionXrefs)
