@@ -4,10 +4,10 @@ import time
 import idaapi
 import idautils
 import ida_kernwin
-import random
+import bisect
 
 from shims import ida_shims
-from collections import deque, defaultdict
+from collections import deque
 
 if idaapi.IDA_SDK_VERSION < 750:
     raise ValueError("Shoo shoo: IDA_SDK_VERSION = %d < 750" % idaapi.IDA_SDK_VERSION)
@@ -15,102 +15,6 @@ if idaapi.IDA_SDK_VERSION < 750:
 # ---------------------------------------------------------------------
 #
 # This part contains common functions used by the plugin.
-#
-# ---------------------------------------------------------------------
-
-class AlleyCatUtils(object):
-    @staticmethod
-    def get_ea_by_name(name):
-        '''
-        Get the address of a location by name.
-
-        @name - Location name
-
-        Returns the address of the named location, or idc.BADADDR on failure.
-        '''
-        # This allows support of the function offset style names (e.g., main+0C)
-        ea = 0
-        if '+' in name:
-            (func_name, offset) = name.split('+')
-            base_ea = ida_shims.get_name_ea_simple(func_name)
-            if base_ea != idc.BADADDR:
-                try:
-                    ea = base_ea + int(offset, 16)
-                except:
-                    ea = idc.BADADDR
-        else:
-            ea = ida_shims.get_name_ea_simple(name)
-            if ea == idc.BADADDR:
-                try:
-                    ea = int(name, 0)
-                except:
-                    ea = idc.BADADDR
-
-        return ea
-
-    @staticmethod
-    def get_name_by_ea(ea):
-        '''
-        Get the name of the specified address.
-
-        @ea - Address.
-
-        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
-        0xXXXXXXXX.
-        '''
-        name = ida_shims.get_name(ea)
-        if name:
-            return name
-        name = ida_shims.get_func_off_str(ea)
-        if name:
-            return name
-        return "0x%X" % ea
-    
-
-    @staticmethod
-    def xrefs_from(ea):
-        '''
-        Find all functions the function containing <ea> calling to.
-
-        @ea - Address.
-
-        Returns a list of addresses.
-        '''
-
-        func = idaapi.get_func(ea)
-        if not func:
-            return []
-
-        start_ea = ida_shims.start_ea(func)
-        end_ea = ida_shims.end_ea(func)
-        if start_ea == idc.BADADDR or end_ea == idc.BADADDR:
-            return []
-
-        xrefs = []
-        
-        ea = start_ea
-        while ea < end_ea:
-            for xref in idautils.XrefsFrom(ea):
-                # Note: A self-reference function will fail this
-                # check. This works best for a normal program. 
-                if end_ea <= xref.to or start_ea >= xref.to:
-                    xrefs.append(xref)
-            
-            ea = ida_shims.next_head(ea)
-            if ea == idc.BADADDR:
-                break
-
-        return xrefs
-    
-# ---------------------------------------------------------------------
-#
-# This code implements BFS (breath first search) to find paths in this
-# graph. While it's quite fast, there's no guarantee that it will keep
-# finding children nodes out in Antartica or not, so a memory limit
-# is placed in case the memory runs out.
-#
-# This variable is global so it's easy to change from the IDAPython
-# prompt.
 #
 # ---------------------------------------------------------------------
 
@@ -732,6 +636,11 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.force_refresh = True
         self.results = results
         self.last_results_timestamps = [root_node.timestamp for root_node in results]
+        
+        # Colorize node cache
+        # Format data for block_ea is { start_block_ea : end_block_ea }
+        self.colorize_cache_func_eas = (None, None)
+        self.colorize_cache_block_eas = [] 
 
         # Info caches.
         self.ea2id: dict[int,int] = {}
@@ -1057,24 +966,35 @@ class AlleyCatGraph(idaapi.GraphViewer):
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
 
     def colorize_node(self, ea, color):
-        # Colorizes an entire code block
-        func = idaapi.get_func(ea)
-        if not func:
-            return
+        start_ea, end_ea = self.colorize_cache_func_eas
         
-        # TODO: slow lookup implementation.
-        # All nodes must be running again and again,
-        # making graph rendering slow...
-        for block in idaapi.FlowChart(func):
-            block_start_ea = ida_shims.start_ea(block)
-            block_end_ea = ida_shims.end_ea(block)
-
-            if block_start_ea <= ea and block_end_ea > ea:
-                ea = block_start_ea
-                while ea < block_end_ea:
-                    idaapi.set_item_color(ea, color)
-                    ea = ida_shims.next_head(ea)
-                break
+        if start_ea == None or not (start_ea <= ea < end_ea):
+            func = idaapi.get_func(ea)
+            if not func:
+                return
+            
+            self.colorize_cache_block_eas = []
+            self.colorize_cache_func_eas = (ida_shims.start_ea(func), 
+                                            ida_shims.end_ea(func))
+            
+            for block in idaapi.FlowChart(func):
+                block_start_ea = ida_shims.start_ea(block)
+                block_end_ea = ida_shims.end_ea(block)
+                self.colorize_cache_block_eas.append((block_start_ea,
+                                                      block_end_ea))
+                self.colorize_cache_block_eas.sort()
+        
+        # Search for block took O(logN)
+        pi = bisect.bisect_left(self.colorize_cache_block_eas, ea, 
+                                key=lambda block_eas:block_eas[0])
+        
+        block_start_ea, block_end_ea = self.colorize_cache_block_eas[pi]
+        if block_start_ea <= ea and block_end_ea > ea:
+            ea = block_start_ea
+            while ea < block_end_ea:
+                idaapi.set_item_color(ea, color)
+                ea = ida_shims.next_head(ea)
+        
 
     def highlight(self, ea):
         # Highlights an entire code block
