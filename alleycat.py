@@ -114,16 +114,89 @@ class AlleyCatUtils(object):
 #
 # ---------------------------------------------------------------------
 
-ALLEYCAT_MEMLIMIT = 10000
+class AlleyCatUtils(object):
+    @staticmethod
+    def get_ea_by_name(name):
+        '''
+        Get the address of a location by name.
 
-class AlleyCatMode:
-    '''
-    Modes of AlleyCat.
-        Start-End: Search path from start to end.
-        XREF-mode: Aimlessly search paths from a node to its surroundings.
-    '''
-    STARTEND = 1
-    XREF     = 2
+        @name - Location name
+
+        Returns the address of the named location, or idc.BADADDR on failure.
+        '''
+        # This allows support of the function offset style names (e.g., main+0C)
+        ea = 0
+        if '+' in name:
+            (func_name, offset) = name.split('+')
+            base_ea = ida_shims.get_name_ea_simple(func_name)
+            if base_ea != idc.BADADDR:
+                try:
+                    ea = base_ea + int(offset, 16)
+                except:
+                    ea = idc.BADADDR
+        else:
+            ea = ida_shims.get_name_ea_simple(name)
+            if ea == idc.BADADDR:
+                try:
+                    ea = int(name, 0)
+                except:
+                    ea = idc.BADADDR
+
+        return ea
+
+    @staticmethod
+    def get_name_by_ea(ea):
+        '''
+        Get the name of the specified address.
+
+        @ea - Address.
+
+        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
+        0xXXXXXXXX.
+        '''
+        name = ida_shims.get_name(ea)
+        if name:
+            return name
+        name = ida_shims.get_func_off_str(ea)
+        if name:
+            return name
+        return "0x%X" % ea
+    
+
+    @staticmethod
+    def xrefs_from(ea):
+        '''
+        Find all functions the function containing <ea> calling to.
+
+        @ea - Address.
+
+        Returns a list of addresses.
+        '''
+
+        func = idaapi.get_func(ea)
+        if not func:
+            return []
+
+        start_ea = ida_shims.start_ea(func)
+        end_ea = ida_shims.end_ea(func)
+        if start_ea == idc.BADADDR or end_ea == idc.BADADDR:
+            return []
+
+        xrefs = []
+        
+        ea = start_ea
+        while ea < end_ea:
+            for xref in idautils.XrefsFrom(ea):
+                # Note: A self-reference function will fail this
+                # check. This works best for a normal program. 
+                if end_ea <= xref.to or start_ea >= xref.to:
+                    xrefs.append(xref)
+            
+            ea = ida_shims.next_head(ea)
+            if ea == idc.BADADDR:
+                break
+
+        return xrefs
 
 def add_to_namespace(namespace, source, name, variable):
     '''
@@ -143,6 +216,29 @@ def add_to_namespace(namespace, source, name, variable):
         sys.modules[source] = m
 
     setattr(importer_module, name, variable)
+    
+# ---------------------------------------------------------------------
+#
+# This code implements BFS (breath first search) to find paths in this
+# graph. While it's quite fast, there's no guarantee that it will keep
+# finding children nodes out in Antartica or not, so a memory limit
+# is placed in case the memory runs out.
+#
+# This variable is global so it's easy to change from the IDAPython
+# prompt.
+#
+# ---------------------------------------------------------------------
+
+ALLEYCAT_MEMLIMIT = 10000
+
+class AlleyCatMode:
+    '''
+    Modes of AlleyCat.
+        Start-End: Search path from start to end.
+        XREF-mode: Aimlessly search paths from a node to its surroundings.
+    '''
+    STARTEND = 1
+    XREF     = 2
 
 class AlleyCatException(Exception):
     pass
@@ -630,28 +726,42 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def __init__(self, results, title="AlleyCat Graph V2"):
         idaapi.GraphViewer.__init__(self, title)
         
+        # Important variables deciding how
+        # to update graph contents smoothly.
         self.soft_refresh = False
         self.force_refresh = True
         self.results = results
         self.last_results_timestamps = [root_node.timestamp for root_node in results]
 
+        # Info caches.
         self.ea2id: dict[int,int] = {}
         self.id2gnodes: dict[int,'AlleyCatGraphicNode'] = {}
 
-        # So we can click to it again to switch to another
+        # We can click the same node again
+        # to switch to another child in the disassembly
+        # graph.
         self.last_focused_node_id = None
         self.last_focused_node_xref_index = -1
         self.last_focused_node_xref_locations = []
 
+        # Implementing node inclusion/exclusion
+        # on the graph. Note: It's currently
+        # useless.
         self.history = AlleyCatGraphHistory()
         self.last_history_index = self.history.history_index
         self.include_on_click = False
         self.exclude_on_click = False
         
+        # If set to False, we need to double click
+        # to jump into node, else we only need
+        # one click
         self.focus_on_click = True
 
+        # If set to True, all corresponding
+        # disassembly lines are highlighted.
         self.is_highlighting_path = True
 
+        # List of command id for the menu items.
         # self.cmd_undo = None
         # self.cmd_redo = None
         # self.cmd_exclude = None
@@ -697,11 +807,11 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def add_node(self, node:'AlleyCatPathNode') -> int:
         gnode = AlleyCatGraphicNode(node)
         
-        gnode_id = super().AddNode(gnode.text)
-        self.ea2id[node.ea] = gnode_id
-        self.id2gnodes[gnode_id] = gnode
+        node_id = super().AddNode(gnode.text)
+        self.ea2id[node.ea] = node_id
+        self.id2gnodes[node_id] = gnode
         
-        return gnode_id
+        return node_id
     
     def add_edge(self, src_node_id, dest_node_id):
         self.id2gnodes[src_node_id].add_connection(dest_node_id)
@@ -755,6 +865,9 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # to trigger clear focus :)
         self.last_focused_node_id = None
         
+        # You always need to highlight first
+        self.is_highlighting_path = True
+        
         # TODO: implement excludes & includes
         # includes = self.history.get_includes()
         # excludes = self.history.get_excludes()
@@ -784,7 +897,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
             node_ea = self.id2gnodes[node_id].ea
             
             updated_node_label = AlleyCatUtils.get_name_by_ea(node_ea) 
-            if updated_node_label != self[node_id]:
+            if updated_node_label != self.id2gnodes[node_id].text:
                 self.id2gnodes[node_id].text = updated_node_label
         
         return True
@@ -1100,6 +1213,7 @@ class AlleyCatPaths(object):
             s = time.time()
             self.__class__.graph = AlleyCatGraph(results, 'Path Graph')
             self.__class__.graph.Show()
+            e = time.time()
             print("Graph initation took %f seconds." % (e-s))
         
     def _get_user_selected_functions(self, many=False):
@@ -1223,57 +1337,20 @@ def find_paths_to_code_block():
 def find_function_xrefs():
     AlleyCatPaths().FindFunctionXrefs()
 
-try:
-    class ToCurrentFromAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_paths_from_many()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-
-
-    class FromCurrentToAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_paths_to_many()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-
-
-    class InCurrentFunctionToCurrentCodeBlockAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_paths_to_code_block()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-        
-    class FunctionXrefAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_function_xrefs()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-        
-except AttributeError:
-    pass
 
 class ActionRegisterer():
+    class DynamicAction(idaapi.action_handler_t):
+        def __init__(self, handler):
+            idaapi.action_handler_t.__init__(self)
+            self.handler = handler
+
+        def activate(self, ctx):
+            self.handler()
+            return 1
+
+        def update(self, ctx):
+            return idaapi.AST_ENABLE_ALWAYS
+
     class ActionConfig:
         pngbytes2id = {}
         
@@ -1345,7 +1422,7 @@ class ActionRegisterer():
         ActionConfig(
             name='funcxref_v2:action',
             menu_name='XREF to/from (interactive)',
-            handler=FunctionXrefAction(),
+            handler=DynamicAction(find_function_xrefs),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1353,7 +1430,7 @@ class ActionRegisterer():
         ActionConfig(
             name="tocurrfrom:action",
             menu_name='Find paths to the current function from...',
-            handler=ToCurrentFromAction(),
+            handler=DynamicAction(find_paths_from_many),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1361,7 +1438,7 @@ class ActionRegisterer():
         ActionConfig(
             name='fromcurrto:action',
             menu_name='Find paths from the current function to...',
-            handler=FromCurrentToAction(),
+            handler=DynamicAction(find_paths_to_many),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1370,17 +1447,21 @@ class ActionRegisterer():
             name='currfunccurrblock:action',
             menu_name='Find paths in the current function to ' \
                                      'the current code block',
-            handler=InCurrentFunctionToCurrentCodeBlockAction(),
+            handler=DynamicAction(find_paths_to_code_block),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
         ),
     ]
+
+    hooks = None
     
     @classmethod
     def init(cls):
         for action in cls.actions:
             action.register()
+        cls.hooks = ActionRegisterer.RegisterPopupMenuHooks(ActionRegisterer.actions)
+        cls.hooks.hook()
             
     @classmethod
     def detach(cls):
@@ -1399,7 +1480,8 @@ class idapathfinder_t(idaapi.plugin_t):
         # accessed from the IDA python terminal.
         global ALLEYCAT_MEMLIMIT
         add_to_namespace(
-            '__main__', 'alleycat', 'ALLEYCAT_MEMLIMIT', ALLEYCAT_MEMLIMIT)
+            '__main__', 'alleycat', 'ALLEYCAT_MEMLIMIT', 
+            ALLEYCAT_MEMLIMIT)
 
         # Add functions to global namespace.
         add_to_namespace(
@@ -1434,10 +1516,3 @@ def PLUGIN_ENTRY():
     return idapathfinder_t()
 
 ActionRegisterer.init()
-
-hooks = [
-    ActionRegisterer.RegisterPopupMenuHooks(ActionRegisterer.actions)
-]
-
-for hook in hooks:
-    hook.hook()
