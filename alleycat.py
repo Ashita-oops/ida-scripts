@@ -1011,7 +1011,16 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # Search for block took O(logN)
         pi = bisect.bisect_left(self.colorize_cache_block_eas, ea, 
                                 key=lambda block_eas:block_eas[0])
+        
+        # Incase self.colorize_cache_block_eas
+        if len(self.colorize_cache_block_eas) == 0:
+            return
+        
+        # Sanity checks. Who knows.
         block_start_ea, block_end_ea = self.colorize_cache_block_eas[pi]
+        if not block_start_ea <= ea < block_end_ea:
+            return
+        
         self._colorize_ea_range(block_start_ea, block_end_ea, color)
         
 
