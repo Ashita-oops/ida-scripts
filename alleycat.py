@@ -3,17 +3,35 @@ import idc
 import time
 import idaapi
 import idautils
+import ida_kernwin
+import ida_graph
 
 from shims import ida_shims
-from collections import deque
+from collections import deque, defaultdict
 
-# This limits the depth of any individual path, as well as the maximum
-# number of paths that will be searched; this is needed for practical
-# reasons, as IDBs with tens of thousands of functions take a long time
-# to exhaust all possible paths without some practical limitation.
+if idaapi.IDA_SDK_VERSION < 700:
+    raise ValueError("Shoo shoo: IDA_SDK_VERSION = %d < 700" % idaapi.IDA_SDK_VERSION)
+
+# ---------------------------------------------------------------------
+# This code implements BFS (breath first search) to find paths in this
+# graph. While it's quite fast, there's no guarantee that it will keep
+# finding children nodes out in Antartica or not, so a memory limit
+# is placed in case the memory runs out.
 #
-# This is global so it's easy to change from the IDAPython prompt.
-ALLEYCAT_LIMIT = 10000
+# This variable is global so it's easy to change from the IDAPython
+# prompt.
+# ---------------------------------------------------------------------
+
+ALLEYCAT_MEMLIMIT = 10000
+
+class AlleyCatMode:
+    '''
+    Modes of AlleyCat.
+        Start-End: Search path from start to end.
+        XREF-mode: Aimlessly search paths from a node to its surroundings.
+    '''
+    STARTEND = 1
+    XREF     = 2
 
 def add_to_namespace(namespace, source, name, variable):
     '''
@@ -34,129 +52,202 @@ def add_to_namespace(namespace, source, name, variable):
 
     setattr(importer_module, name, variable)
 
-class AlleyCatColor:
-    GRAPH_EDGE_NODE = 0xff007b
-    GRAPH_START_NODE = 0x483882
-    GRAPH_END_NODE = 0x1f130e
-
 class AlleyCatException(Exception):
     pass
 
 class AlleyCatPathNode(object):
     '''
-    Class which stores 
+    Class which stores info of a path node in a graph.
     '''
-    def __init__(self, ea: int, xrefs: list['AlleyCatPathNode'] = None):
+    
+    IS_ROOT = 1
+    IS_EDGE = 2
+    IS_TARGET = 4
+
+    def __init__(self, ea:int, is_root=False, is_target=False):
         self.ea = ea
-        self.xrefs = xrefs if xrefs != None else []
-        self.xrefs_eas = set()
-        if xrefs:
-            for xref in xrefs:
-                self.xrefs_eas.add(xref.ea)
+        self.xrefs_to = []
+        self.xrefs_from = []
+        self.xrefs_to_eas = set()
+        self.xrefs_from_eas = set()
+        self.timestamp = time.time() 
 
-    def add_xref(self, xref_node: 'AlleyCatPathNode'):
-        if xref_node.ea in self.xrefs_eas:
-            return
-        self.xrefs_eas.add(xref_node.ea)
-        self.xrefs.append(xref_node)
+        self.status = 0
+        if is_root:
+            self.status |= self.IS_ROOT
+        if is_target:
+            self.status |= self.IS_TARGET
+        if not is_root and not is_target:
+            self.status = self.IS_EDGE
 
+    def add_xref_to(self, xref_to:'AlleyCatPathNode'):
+        if xref_to.ea not in self.xrefs_to_eas:
+            self.xrefs_to_eas.add(xref_to.ea)
+            self.xrefs_to.append(xref_to)
 
-class AlleyCat(object):
+    def add_xref_from(self, xref_from:'AlleyCatPathNode'):
+        if xref_from.ea not in self.xrefs_from_eas:
+            self.xrefs_from_eas.add(xref_from.ea)
+            self.xrefs_from.append(xref_from)
+
+    def is_root(self):
+        return self.status & self.IS_ROOT != 0
+    def is_target(self):
+        return self.status & self.IS_TARGET != 0
+    def is_edge(self):
+        return self.status & self.IS_EDGE != 0
+    def is_outer(self):
+        return len(self.xrefs_from) == 0 and len(self.xrefs_to) == 0 
+    
+class AlleyCatUtils(object):
+    @staticmethod
+    def get_ea_by_name(name):
+        '''
+        Get the address of a location by name.
+
+        @name - Location name
+
+        Returns the address of the named location, or idc.BADADDR on failure.
+        '''
+        # This allows support of the function offset style names (e.g., main+0C)
+        ea = 0
+        if '+' in name:
+            (func_name, offset) = name.split('+')
+            base_ea = ida_shims.get_name_ea_simple(func_name)
+            if base_ea != idc.BADADDR:
+                try:
+                    ea = base_ea + int(offset, 16)
+                except:
+                    ea = idc.BADADDR
+        else:
+            ea = ida_shims.get_name_ea_simple(name)
+            if ea == idc.BADADDR:
+                try:
+                    ea = int(name, 0)
+                except:
+                    ea = idc.BADADDR
+
+        return ea
+
+    @staticmethod
+    def get_name_by_ea(ea):
+        '''
+        Get the name of the specified address.
+
+        @ea - Address.
+
+        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
+        0xXXXXXXXX.
+        '''
+        name = ida_shims.get_name(ea)
+        if name:
+            return name
+        name = ida_shims.get_func_off_str(ea)
+        if name:
+            return name
+        return "0x%X" % ea
+
+class AlleyCatCommon(object):
     '''
-    Class which resolves code paths. This is where most of the work is done.
+    Class which includes common functions
     '''
-
     def _name(self, ea):
         name = ida_shims.get_name(ea)
         if name:
             return name
-
         name = ida_shims.get_func_off_str(ea)
         if name:
             return name      
-
         return '0x%X' % ea
 
     def _get_code_block(self, ea):
         return idaapi.get_func(ea)
+    
+    @staticmethod
+    def get_mode():
+        return -1
+    
+    def get_npaths(self):
+        return -1
+
+class AlleyCatSE(AlleyCatCommon):
+    '''
+    Class which resolves code paths from starting point to end. This is where most of the work is done.
+    '''
 
     def __init__(self, start, end, quiet=False):
         '''
         Class constructor.
 
-        @start - The start address.
-        @end   - The end address.
+        @start  - The start address.
+        @end    - The end address.
 
         Returns None.
         '''
-        global ALLEYCAT_LIMIT
-        self.limit = ALLEYCAT_LIMIT
+        global ALLEYCAT_MEMLIMIT
+        self.memlimit = ALLEYCAT_MEMLIMIT
         self.root = None
-        self.npaths = 1
         self.quiet = quiet
+        self.nodes = {}
+        self.start = start
+        self.end = end
 
-        # We work backwards via xrefs, so we start at the end and end at the
-        # start
         if not self.quiet:
-            print("Generating call paths from %s to %s..." % (self._name(end),
-                                                              self._name(start)))
-        self._build_paths(start, end)
-        self._calc_npaths()
-        self._debug_print_path()
+            print("Generating call paths from %s to %s..." % (self._name(start),
+                                                              self._name(end)))
+        self._build_paths()
+        # self._debug_print_path()
 
-    def _set_root(self, node):
+    def _set_root(self, node) -> None:
         self.root = node
 
-    def _build_paths(self, start, end=idc.BADADDR):
-        if start == end:
-            self._set_root(AlleyCatPathNode(ea=start))
+    def _build_paths(self) -> None:
+        if self.start == self.end:
+            self._set_root(AlleyCatPathNode(ea=self.end, is_root=True, is_target=True))
             return
 
+        # We work backwards via xrefs_to, so we start at the end and end at the start
+        end_node = AlleyCatPathNode(ea=self.end, is_target=True)
+        self.nodes[self.end] = end_node
+        
         bfs_queue = deque()
-        bfs_queue.append(AlleyCatPathNode(ea=start))
-        bfs_visited_nodes = {}
+        bfs_queue.append(end_node)
+        bfs_visited_nodes = set()
 
-        # Loop until queue exceeds ALLEYCAT_LIMIT :)
-        while bfs_queue and len(bfs_queue) < self.limit: 
+        while bfs_queue and len(bfs_queue) < self.memlimit: 
             callee_node = bfs_queue.popleft()
-            # if callee_node.ea in bfs_visited_nodes:
-            #     continue
-            # if callee_node.ea == end:
-            #     self._set_root(callee_node)                
-            bfs_visited_nodes[callee_node.ea] = callee_node
+            if callee_node.ea in bfs_visited_nodes:
+                continue
+            bfs_visited_nodes.add(callee_node.ea)
 
-            for xref in idautils.XrefsTo(callee_node.ea):
-                caller = self._get_code_block(xref.frm)
+            for xref_to in idautils.XrefsTo(callee_node.ea):
+                caller = self._get_code_block(xref_to.frm)
                 if not caller:
                     continue
                 
                 caller_ea = ida_shims.start_ea(caller)
-                if caller_ea in bfs_visited_nodes:
-                    caller_node = bfs_visited_nodes[caller_ea]
-                else:
-                    caller_node = AlleyCatPathNode(ea=caller_ea)
-                    bfs_queue.append(caller_node)
-                    if caller_ea == end:
-                        self._set_root(caller_node)
                 
-                caller_node.add_xref(callee_node)
+                if caller_ea in self.nodes:
+                    caller_node = self.nodes[caller_ea]
+                elif caller_ea == self.start:
+                    self.nodes[caller_ea] = caller_node = AlleyCatPathNode(ea=caller_ea, is_root=True)
+                    self._set_root(caller_node)
+                else:
+                    self.nodes[caller_ea] = caller_node = AlleyCatPathNode(ea=caller_ea)
+                
+                caller_node.add_xref_from(callee_node)
 
-    def _calc_npaths(self):
-        '''
-        Calculate number of paths to target. 
-        '''
-        pass
+                if caller_ea not in bfs_visited_nodes:
+                    bfs_queue.append(caller_node)
 
-    def _debug_print_path(self):
+    def _debug_print_path(self) -> None:
         '''
-        Debug path from a node to the end node :)
+        Display path from start node to the end node,
+        using tree representation.
         '''
         class PrintContext:
-            def __init__(self, is_ref_by: int = None, is_parent_last_child: list = None):
-                if is_ref_by != None:
-                    self.is_ref_by = is_ref_by
-                else:
-                    self.is_ref_by = 0xffffffff
+            def __init__(self, is_ref_by:int=0xffffffff, is_parent_last_child:list[bool]=None):
+                self.is_ref_by = is_ref_by
                     
                 if is_parent_last_child != None:                
                     self.is_parent_last_child = is_parent_last_child
@@ -189,12 +280,11 @@ class AlleyCat(object):
             disp += '\n' 
             if node.ea in v:
                 disp = disp[:-1] + ' -> ...\n'
-                # disp = disp[:-1] + " -(loop)-\n"
                 continue
 
             v.add(node.ea)
 
-            for i, child_node in enumerate(node.xrefs):
+            for i, child_node in enumerate(node.xrefs_to):
                 q.append((child_node, PrintContext(
                                         is_ref_by = node.ea,
                                         is_parent_last_child = ctx.is_parent_last_child + [i==0]
@@ -203,28 +293,29 @@ class AlleyCat(object):
 
         print(disp)
 
-class AlleyCatFunctionPaths(AlleyCat):
+    @staticmethod
+    def get_mode():
+        return AlleyCatMode.STARTEND
+
+class AlleyCatFunctionPaths(AlleyCatSE):
     def __init__(self, start_ea, end_ea, quiet=False):
-        # We work backwards via xrefs, so we start at the end and end at the start
         try:
-            func = idaapi.get_func(end_ea)
-            start = ida_shims.start_ea(func)
+            end = ida_shims.start_ea(idaapi.get_func(end_ea))
         except:
             raise AlleyCatException("Address 0x%X is not part of a function!" %
                                     end_ea)
         try:
-            func = idaapi.get_func(start_ea)
-            end = ida_shims.start_ea(func)
+            start = ida_shims.start_ea(idaapi.get_func(start_ea))
         except:
-            end = idc.BADADDR
+            start = idc.BADADDR
 
         super(AlleyCatFunctionPaths, self).__init__(start, end, quiet)
 
 
-class AlleyCatCodePaths(AlleyCat):
+class AlleyCatCodePaths(AlleyCatSE):
     def __init__(self, start_ea, end_ea, quiet=False):
-        end_func = idaapi.get_func(end_ea)
         start_func = idaapi.get_func(start_ea)
+        end_func   = idaapi.get_func(end_ea)
 
         if not start_func:
             raise AlleyCatException("Address 0x%X is not part of a function!" %
@@ -234,17 +325,16 @@ class AlleyCatCodePaths(AlleyCat):
                                     end_ea)
 
         start_func_ea = ida_shims.start_ea(start_func)
-        end_func_ea = ida_shims.start_ea(end_func)
+        end_func_ea   = ida_shims.start_ea(end_func)
         if start_func_ea != end_func_ea:
             raise AlleyCatException("The start and end addresses are not part "
                                     "of the same function!")
 
-        self.func = start_func
+        self.func   = start_func
         self.blocks = [block for block in idaapi.FlowChart(self.func)]
 
-        # We work backwards via xrefs, so we start at the end and end at the start
-        end_block = self._get_code_block(start_ea)
-        start_block = self._get_code_block(end_ea)
+        start_block = self._get_code_block(start_ea)
+        end_block   = self._get_code_block(end_ea)
 
         if not end_block:
             raise AlleyCatException("Failed to find the code block associated "
@@ -254,7 +344,7 @@ class AlleyCatCodePaths(AlleyCat):
                                     "with address 0x%X" % end_ea)
 
         start_block_ea = ida_shims.start_ea(start_block)
-        end_block_ea = ida_shims.start_ea(end_block)
+        end_block_ea   = ida_shims.start_ea(end_block)
 
         super(AlleyCatCodePaths, self).__init__(
             start_block_ea, end_block_ea, quiet)
@@ -266,9 +356,144 @@ class AlleyCatCodePaths(AlleyCat):
             if start_ea <= ea and end_ea > ea:
                 return block
         return None
+    
+
+class AlleyCatXR(AlleyCatCommon):
+    '''
+    Class which computes path from and to of a graph, with a choice :)
+    Mostly copied from AlleyCat :'3
+    '''
+
+    def __init__(self, start, xref_to_depth, xref_from_depth, quiet=False):
+        '''
+        Class constructor.
+
+        @start              - The start address.
+        @xref_to_depth      - Maximum depth to search backward.
+        @xref_from_depth    - Maximum depth to search forward.
+
+        Returns None.
+        '''
+        global ALLEYCAT_MEMLIMIT
+        self.memlimit = ALLEYCAT_MEMLIMIT
+        self.root = None
+        self.quiet = quiet
+        self.nodes = {}
+        self.start = start
+        self.xref_to_depth   = (xref_to_depth   if xref_to_depth != None else 0)
+        self.xref_from_depth = (xref_from_depth if xref_from_depth != None else 0)
+
+        if not self.quiet:
+            print("Generating call paths from %s with "     \
+                  "xref_to_depth=%d, xref_from_depth=%d..." \
+                                      % (self._name(start),
+                                         self.xref_to_depth,
+                                         self.xref_from_depth))
+        self._build_paths()
+
+    def _set_root(self, node):
+        self.root = node
+
+    @staticmethod
+    def _xrefs_from(ea):
+        func = idaapi.get_func(ea)
+        if not func:
+            return []
+
+        start_ea = ida_shims.start_ea(func)
+        end_ea = ida_shims.end_ea(func)
+
+        xrefs = []
+        for ea in range(start_ea, end_ea):
+            for xref in idautils.XrefsFrom(ea):
+                if end_ea <= xref.to or start_ea >= xref.to:
+                    xrefs.append(xref)
+
+        return xrefs
+
+    def _build_paths(self):
+        start_node = AlleyCatPathNode(ea=self.start, is_target=True)
+        self.nodes[self.start] = start_node
+        self._set_root(start_node)
+        self._build_directional_path(fwd=False)
+        self._build_directional_path(fwd=True)
+
+    def _build_directional_path(self, fwd):
+        if not self.root:
+            return
+        
+        bfs_queue = deque()
+        bfs_queue.append((self.root, 0))
+        bfs_visited_nodes = set()
+
+        while bfs_queue and len(bfs_queue) < self.memlimit: 
+            node, depth = bfs_queue.popleft()
+            
+            if fwd and depth >= self.xref_from_depth:
+                break
+            elif not fwd and depth >= self.xref_to_depth:
+                break   
+
+            if node.ea in bfs_visited_nodes:
+                continue
+            bfs_visited_nodes.add(node.ea)
+
+            # if fwd, search forward nodes,
+            # if bck, search backward nodes,
+            if fwd:
+                xrefs = self._xrefs_from(node.ea)
+            else:
+                xrefs = idautils.XrefsTo(node.ea)
+
+            for xref in xrefs:
+                if fwd:
+                    child = self._get_code_block(xref.to)
+                else:
+                    child = self._get_code_block(xref.frm)
+                if not child:
+                    continue
+                
+                child_ea = ida_shims.start_ea(child)
+                
+                if child_ea in self.nodes:
+                    child_node = self.nodes[child_ea]
+                else:
+                    self.nodes[child_ea] = child_node = AlleyCatPathNode(ea=child_ea)
+                
+                if fwd:
+                    node.add_xref_from(child_node)
+                else:
+                    node.add_xref_to(child_node)
+
+                if child_ea not in bfs_visited_nodes:
+                    bfs_queue.append((child_node, depth+1))
+
+    @staticmethod
+    def get_mode():
+        return AlleyCatMode.XREF
 
 
+class AlleyCatFunctionXrefs(AlleyCatXR):
+    def __init__(self, start_ea, xref_to_depth, xref_from_depth, quiet=False):
+        try:
+            start = ida_shims.start_ea(idaapi.get_func(start_ea))
+            super(AlleyCatFunctionXrefs, self).__init__(start, xref_to_depth, xref_from_depth, quiet)
+        except Exception as e:
+            raise AlleyCatException("Address 0x%X is not part of a function!" 
+                                    % start_ea)
+
+# ---------------------------------------------------------------------
+#
 # Everything below here is just IDA UI/Plugin stuff
+# 
+# ---------------------------------------------------------------------
+class AlleyCatColor:
+    GRAPH_EDGE_NODE = 0xff007b
+    GRAPH_START_NODE = 0x483882
+    GRAPH_END_NODE = 0x483882
+    GRAPH_OUTER_NODE = 0x191919
+    HIGHLIGHT_MAIN_GRAPH = 0x41076d
+    
 
 class AlleyCatGraphHistory(object):
     '''
@@ -321,19 +546,24 @@ class AlleyCatGraphHistory(object):
         return set(self.excludes[0:self.exclude_index+1])
 
     def undo(self):
-        if self.history:
-            if self.history[self.history_index] == self.INCLUDE_ACTION:
-                if self.include_index >= 0:
-                    self.include_index -= 1
-            elif self.history[self.history_index] == self.EXCLUDE_ACTION:
-                if self.exclude_index >= 0:
-                    self.exclude_index -= 1
+        if not self.history:
+            return
+        
+        if self.history[self.history_index] == self.INCLUDE_ACTION:
+            if self.include_index >= 0:
+                self.include_index -= 1
+        elif self.history[self.history_index] == self.EXCLUDE_ACTION:
+            if self.exclude_index >= 0:
+                self.exclude_index -= 1
 
-            self.history_index -= 1
-            if self.history_index < 0:
-                self.history_index = 0
+        self.history_index -= 1
+        if self.history_index < 0:
+            self.history_index = 0
 
     def redo(self):
+        if not self.history:
+            return
+        
         self.history_index += 1
         if self.history_index >= len(self.history):
             self.history_index = len(self.history)-1
@@ -345,6 +575,26 @@ class AlleyCatGraphHistory(object):
             if self.exclude_index < len(self.excludes)-1:
                 self.exclude_index += 1
 
+class AlleyCatGraphicNode(object):
+    def __init__(self, node:'AlleyCatPathNode'):
+        self.ea = node.ea
+        
+        self.text = AlleyCatUtils.get_name_by_ea(node.ea)
+        
+        self.color = idc.DEFCOLOR
+        if node.is_root():
+            self.color = AlleyCatColor.GRAPH_START_NODE
+        elif node.is_target():
+            self.color = AlleyCatColor.GRAPH_END_NODE
+        elif node.is_outer():
+            self.color = AlleyCatColor.GRAPH_OUTER_NODE
+        elif node.is_edge():
+            self.color = AlleyCatColor.GRAPH_EDGE_NODE
+
+        self.edges = set()
+
+    def add_connection(self, child_node_id):
+        self.edges.add(child_node_id)
 
 class AlleyCatGraph(idaapi.GraphViewer):
     '''
@@ -352,25 +602,35 @@ class AlleyCatGraph(idaapi.GraphViewer):
     '''
     def __init__(self, results, title="AlleyCat Graph V2"):
         idaapi.GraphViewer.__init__(self, title)
+        self.soft_refresh = False
+        self.force_refresh = True
         self.results = results
+        self.last_results_timestamps = [root_node.timestamp for root_node in results]
 
-        self.nodes_ea2id = {}
-        self.nodes_id2ea = {}
-        self.edges = {}
-        self.end_nodes = []
-        self.edge_nodes = []
-        self.start_nodes = []
+        self.ea2id: dict[int,int] = {}
+        self.id2gnodes: dict[int,'AlleyCatGraphicNode'] = {}
+
+        # So we can click to it again to switch to another
+        self.last_focused_node_id = None
+        self.last_focused_node_xref_index = -1
+        self.last_focused_node_xref_locations = []
 
         self.history = AlleyCatGraphHistory()
+        self.last_history_index = self.history.history_index
         self.include_on_click = False
         self.exclude_on_click = False
+        
+        self.focus_on_click = True
 
-        self.cmd_undo = None
-        self.cmd_redo = None
-        self.cmd_reset = None
-        self.cmd_exclude = None
-        self.cmd_include = None
-        self.cmd_unhighlight = None
+        self.is_highlighting_path = True
+
+        # self.cmd_undo = None
+        # self.cmd_redo = None
+        # self.cmd_exclude = None
+        # self.cmd_include = None
+        self.cmd_refresh = None
+        self.cmd_toggle_highlight = None
+        self.cmd_toggle_focus_on_click = None
 
     def Show(self):
         '''
@@ -381,234 +641,276 @@ class AlleyCatGraph(idaapi.GraphViewer):
         if not idaapi.GraphViewer.Show(self):
             return False
         else:
-            self.cmd_undo = self.AddCommand("Undo", "")
-            self.cmd_redo = self.AddCommand("Redo", "")
-            self.cmd_reset = self.AddCommand("Reset graph", "")
-            self.cmd_exclude = self.AddCommand("Exclude node", "")
-            self.cmd_include = self.AddCommand("Include node", "")
-            self.cmd_unhighlight = self.AddCommand(
-                "Temporarily un-highlight all paths", "")
-            return True
+            # TODO: implement UI hooks to toggle shortcuts :')
 
-    def OnRefresh(self):
+            # self.cmd_undo = self.AddCommand("Undo", "")
+            # self.cmd_redo = self.AddCommand("Redo", "")
+            # self.cmd_exclude = self.AddCommand("Exclude node", "")
+            # self.cmd_include = self.AddCommand("Include node", "")
+            self.cmd_refresh = self.AddCommand("Refresh graph", "R")
+            self.cmd_toggle_highlight = self.AddCommand(
+                "Toggle highlight/un-highlight all paths", "H")
+            self.cmd_toggle_focus_on_click = self.AddCommand(
+                "Toggle focus to address on click", "")
+
+            return True
+        
+    def clear(self):
+        self.ea2id = {}
+        self.id2gnodes = {}
+        
+        # Clears the graph and unhighlights the disassembly
+        self.Clear()
+        self.toggle_highlight_all(highlight=False)
+        
+    def add_node(self, node:'AlleyCatPathNode') -> int:
+        gnode = AlleyCatGraphicNode(node)
+        
+        gnode_id = super().AddNode(gnode.text)
+        self.ea2id[node.ea] = gnode_id
+        self.id2gnodes[gnode_id] = gnode
+        
+        return gnode_id
+    
+    def add_edge(self, src_node_id, dest_node_id):
+        self.id2gnodes[src_node_id].add_connection(dest_node_id)
+        return super().AddEdge(src_node_id, dest_node_id)
+        
+    def update_results(self, results):
+        self.results = results
+        self.force_refresh = True
+
+    def _do_directional_refresh(self, root_node, fwd=True):
+        bfs_queue = deque()
+        bfs_queue.append(root_node)
+        bfs_visited = set()
+
+        while bfs_queue:
+            curr_node = bfs_queue.popleft()
+            if curr_node.ea in bfs_visited:
+                continue
+
+            bfs_visited.add(curr_node.ea)
+
+            # Highlight this node in the disassembly window
+            self.highlight(curr_node.ea)
+
+            curr_gnode_id = self.ea2id[curr_node.ea]
+
+            if fwd:
+                child_nodes = curr_node.xrefs_from
+            else:
+                child_nodes = curr_node.xrefs_to
+
+            for child_node in child_nodes:
+                if child_node.ea not in self.ea2id:
+                    child_gnode_id = self.add_node(child_node)
+                else:
+                    child_gnode_id = self.ea2id[child_node.ea]
+
+                if fwd:
+                    self.add_edge(curr_gnode_id, child_gnode_id)
+                else:
+                    self.add_edge(child_gnode_id, curr_gnode_id)
+
+                if child_node.ea not in bfs_visited:
+                    bfs_queue.append(child_node)
+        
+    def _do_hard_refresh(self):
         # Clear the graph before refreshing
         self.clear()
         
-        self.nodes_ea2id = {}
-        self.nodes_id2ea = {}
-        self.edges = {}
-        self.end_nodes = []
-        self.edge_nodes = []
-        self.start_nodes = []
+        # Setting this only is already enough
+        # to trigger clear focus :)
+        self.last_focused_node_id = None
+        
+        # TODO: implement excludes & includes
+        # includes = self.history.get_includes()
+        # excludes = self.history.get_excludes()
 
-        includes = self.history.get_includes()
-        excludes = self.history.get_excludes()
+        for root_node in self.results:
+            if root_node.ea not in self.ea2id:
+                self.add_node(root_node)
 
-        for path in self.results:
-            parent_node = None
+            if root_node.xrefs_to:
+                self._do_directional_refresh(root_node, fwd=False)
 
-            # Check to see if this path contains all nodes marked for explicit
-            # inclusion
-            # NOTE: the repeatedly calls to set() increases time :(
-            if (set(path) & includes) != includes:
-                continue
-
-            # Check to see if this path contains any nodes marked for explicit
-            # exclusion
-            # NOTE: the repeatedly calls to set() increases time :(
-            if (set(path) & excludes) != set():
-                continue
-
-            for ea in path:
-                # If this node already exists, use its existing node ID
-                if ea in self.nodes_ea2id:
-                    this_node = self.nodes_ea2id[ea]
-                # Else, add this node to the graph
-                else:
-                    this_node = self.AddNode(self.get_name_by_ea(ea))
-                    self.nodes_ea2id[ea] = this_node
-                    self.nodes_id2ea[this_node] = ea
-
-                # If there is a parent node, add an edge between the parent node
-                # and this one
-                if parent_node is not None:
-                    self.AddEdge(parent_node, this_node)
-                    if this_node not in self.edges[parent_node]:
-                        self.edges[parent_node].append(this_node)
-
-                # Update the parent node for the next loop
-                parent_node = this_node
-                if parent_node not in self.edges:
-                    self.edges[parent_node] = []
-
-                # Highlight this node in the disassembly window
-                self.highlight(ea)
-
-            try:
-                # Track the first, last, and next to last nodes in each path for
-                # proper colorization in self.OnGetText.
-                self.start_nodes.append(self.nodes_ea2id[path[0]])
-                self.end_nodes.append(self.nodes_ea2id[path[-1]])
-                self.edge_nodes.append(self.nodes_ea2id[path[-2]])
-            except:
-                pass
+            if root_node.xrefs_from:
+                self._do_directional_refresh(root_node, fwd=True)
 
         return True
+    
+    def _do_soft_refresh(self):
+        '''
+        This function only track changes
+        in function label. 
+        
+        Useful when a small rename doesn't
+        trigger the whole graph to be redrawn.
+        '''
+        
+        for node_id in self.id2gnodes:
+            node_ea = self.id2gnodes[node_id].ea
+            
+            updated_node_label = AlleyCatUtils.get_name_by_ea(node_ea) 
+            if updated_node_label != self[node_id]:
+                self.id2gnodes[node_id].text = updated_node_label
+        
+        return True
 
+    def OnRefresh(self):
+        curr_results_timestamps = list(root_node.timestamp for root_node in self.results)
+                
+        if (
+            self.force_refresh or
+            self.last_results_timestamps != curr_results_timestamps or
+            self.last_history_index != self.history.history_index
+        ):
+            self.force_refresh = False
+            self.last_results_timestamps = curr_results_timestamps
+            self.last_history_index = self.history.history_index
+            return self._do_hard_refresh()
+
+        if self.soft_refresh:
+            self.soft_refresh = False
+            return self._do_soft_refresh()
+
+        return True
+    
     def OnGetText(self, node_id):
-        color = idc.DEFCOLOR
+        if node_id not in self.id2gnodes:
+            return "(corrupted)", idc.DEFCOLOR
 
-        if node_id in self.edge_nodes:
-            color = 0xff007b
-        elif node_id in self.start_nodes:
-            color = 0x483882
-        elif node_id in self.end_nodes:
-            color = 0x1f130e
-
-        return self[node_id], color
+        gnode = self.id2gnodes[node_id]
+        return gnode.text, gnode.color
 
     def OnHint(self, node_id):
+        if node_id not in self.id2gnodes:
+            return ""
+
         hint = ""
-
-        try:
-            for edge_node in self.edges[node_id]:
-                hint += "%s\n" % self[edge_node]
-        except:
-            pass
-
+        for edge_node_id in self.id2gnodes[node_id].edges:
+            hint += "%s\n" % self[edge_node_id]
         return hint
+    
+    def OnEdgeHint(self, src, dst):
+        # Display bug: Sometimes on idle, OnEdgeHint is
+        # triggered with (src == 0, dst == 0). To counter
+        # this, I added a check to see if dst is a child
+        # of src.
+        if (dst not in self.id2gnodes or
+            src not in self.id2gnodes or 
+            dst not in self.id2gnodes[src].edges):
+            return ""
 
-    def OnCommand(self, cmd_id):
-        if self.cmd_undo == cmd_id:
-            if self.include_on_click or self.exclude_on_click:
-                self.include_on_click = False
-                self.exclude_on_click = False
-            else:
-                self.history.undo()
-            self.Refresh()
+        displen = max(len(self[src]), len(self[dst]))
+        return "%s\n%s\n%s" % (self[src].center(displen), 
+                               '↓'.center(displen), 
+                               self[dst].center(displen))
 
-        elif self.cmd_redo == cmd_id:
-            self.history.redo()
-            self.Refresh()
+    def OnCommand(self, cmd_id):        
+        # if self.cmd_undo == cmd_id:
+        #     if self.include_on_click or self.exclude_on_click:
+        #         self.include_on_click = False
+        #         self.exclude_on_click = False
+        #     else:
+        #         self.history.undo()
+        #     self.Refresh()
 
-        elif self.cmd_include == cmd_id:
-            self.include_on_click = True
+        # elif self.cmd_redo == cmd_id:
+        #     self.history.redo()
+        #     self.Refresh()
 
-        elif self.cmd_exclude == cmd_id:
-            self.exclude_on_click = True
+        # elif self.cmd_include == cmd_id:
+        #     self.include_on_click = True
 
-        elif self.cmd_reset == cmd_id:
+        # elif self.cmd_exclude == cmd_id:
+        #     self.exclude_on_click = True
+
+        if self.cmd_toggle_focus_on_click == cmd_id:
+            self.focus_on_click = not self.focus_on_click
+
+        elif self.cmd_refresh == cmd_id:
             self.include_on_click = False
             self.exclude_on_click = False
             self.history.reset()
+            self.soft_refresh = True
             self.Refresh()
 
-        elif self.cmd_unhighlight == cmd_id:
-            self.unhighlight_all()
+        elif self.cmd_toggle_highlight == cmd_id:
+            self.is_highlighting_path = not self.is_highlighting_path
+            self.toggle_highlight_all(highlight=self.is_highlighting_path)
+            
+        return 0
+            
+    def _focus_on_node(self, node_id):
+        if node_id in self.id2gnodes:
+            node_ea = self.id2gnodes[node_id].ea
+        else:
+            node_ea = AlleyCatUtils.get_ea_by_name(self[node_id])
 
-    def OnClick(self, node_id):
-        if self.include_on_click:
-            self.history.add_include(self.nodes_id2ea[node_id])
-            self.include_on_click = False
+        if self.last_focused_node_id != node_id:
+            self.last_focused_node_id = node_id
+            self.last_focused_node_xref_index = 0
+            self.last_focused_node_xref_locations = []
 
-        elif self.exclude_on_click:
-            self.history.add_exclude(self.nodes_id2ea[node_id])
-            self.exclude_on_click = False
-        
-        self.Refresh()
+            if node_id in self.id2gnodes:
+                for edge_node_id in self.id2gnodes[node_id].edges:
+                    if edge_node_id in self.id2gnodes:
+                        edge_node_ea = self.id2gnodes[edge_node_id].ea
+                    else:
+                        edge_node_ea = AlleyCatUtils.get_ea_by_name(self[edge_node_id])
 
-    def OnDblClick(self, node_id):
-        xref_locations = []
-        node_ea = self.get_ea_by_name(self[node_id])
+                    if edge_node_ea == idc.BADADDR:
+                        continue
 
-        if node_id in self.edges:
-            for edge_node_id in self.edges[node_id]:
-
-                edge_node_name = self[edge_node_id]
-                edge_node_ea = self.get_ea_by_name(edge_node_name)
-
-                if edge_node_ea != idc.BADADDR:
                     for xref in idautils.XrefsTo(edge_node_ea):
-                        # Is the specified node_id the source of this xref?
                         if self.match_xref_source(xref, node_ea):
-                            xref_locations.append((xref.frm, edge_node_ea))
+                            self.last_focused_node_xref_locations.append((xref.frm, edge_node_ea))
 
-        if xref_locations:
-            xref_locations.sort()
+            if self.last_focused_node_xref_locations:
+                self.last_focused_node_xref_locations.sort()
 
-            print("")
-            print("Path Xrefs from %s:" % self[node_id])
-            print("-" * 100)
-            for (xref_ea, dst_ea) in xref_locations:
-                print("%-50s  =>  %s" % (self.get_name_by_ea(xref_ea),
-                                         self.get_name_by_ea(dst_ea)))
-            print("-" * 100)
-            print("")
+                print("")
+                print("Path Xrefs from %s:" % self[node_id])
+                print("-" * 100)
+                for (xref_ea, dst_ea) in self.last_focused_node_xref_locations:
+                    print("%-50s  =>  %s" % (AlleyCatUtils.get_name_by_ea(xref_ea),
+                                             AlleyCatUtils.get_name_by_ea(dst_ea)))
+                print("-" * 100)
+                print("")
 
-            ida_shims.jumpto(xref_locations[0][0])
+                self.last_focused_node_xref_locations.append((node_ea, node_ea))
+
+        if self.last_focused_node_xref_locations:
+            ida_shims.jumpto(self.last_focused_node_xref_locations[self.last_focused_node_xref_index][0])
+            self.last_focused_node_xref_index += 1
+            self.last_focused_node_xref_index %= len(self.last_focused_node_xref_locations)
         else:
             ida_shims.jumpto(node_ea)
 
+
+    def OnClick(self, node_id):
+        if self.include_on_click:
+            self.history.add_include(self.id2gnodes[node_id].ea)
+            self.include_on_click = False
+            self.Refresh()
+        elif self.exclude_on_click:
+            self.history.add_exclude(self.id2gnodes[node_id].ea)
+            self.exclude_on_click = False
+            self.Refresh()
+        elif self.focus_on_click:
+            self._focus_on_node(node_id)
+
+    def OnDblClick(self, node_id):
+        self._focus_on_node(node_id)
+
     def OnClose(self):
-        if ida_shims.ask_yn(1, "Path nodes have been highlighted in the "
-                               "disassembly window. Undo highlighting?") == 1:
-            self.unhighlight_all()
+        self.toggle_highlight_all(highlight=False)
 
     def match_xref_source(self, xref, source):
         return ((xref.type != idc.fl_F) and
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
-
-    def get_ea_by_name(self, name):
-        '''
-        Get the address of a location by name.
-
-        @name - Location name
-
-        Returns the address of the named location, or idc.BADADDR on failure.
-        '''
-        # This allows support of the function offset style names (e.g., main+0C)
-        ea = 0
-        if '+' in name:
-            (func_name, offset) = name.split('+')
-            base_ea = ida_shims.get_name_ea_simple(func_name)
-            if base_ea != idc.BADADDR:
-                try:
-                    ea = base_ea + int(offset, 16)
-                except:
-                    ea = idc.BADADDR
-        else:
-            ea = ida_shims.get_name_ea_simple(name)
-            if ea == idc.BADADDR:
-                try:
-                    ea = int(name, 0)
-                except:
-                    ea = idc.BADADDR
-
-        return ea
-
-    def clear(self):
-        # Clears the graph and unhighlights the disassembly
-        self.Clear()
-        self.unhighlight_all()
-
-    def get_name_by_ea(self, ea):
-        '''
-        Get the name of the specified address.
-
-        @ea - Address.
-
-        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
-        0xXXXXXXXX.
-        '''
-        name = ida_shims.get_name(ea)
-        if name:
-            return name
-
-        name = ida_shims.get_func_off_str(ea)
-        if name:
-            return name
-        
-        return "0x%X" % ea
 
     def colorize_node(self, ea, color):
         # Colorizes an entire code block
@@ -629,58 +931,143 @@ class AlleyCatGraph(idaapi.GraphViewer):
 
     def highlight(self, ea):
         # Highlights an entire code block
-        self.colorize_node(ea, 0x41076d)
+        self.colorize_node(ea, AlleyCatColor.HIGHLIGHT_MAIN_GRAPH)
 
     def unhighlight(self, ea):
         # Unhighlights an entire code block
         self.colorize_node(ea, idc.DEFCOLOR)
 
-    def unhighlight_all(self):
+    def toggle_highlight_all(self, highlight=True):
         # Unhighlights all code blocks
-        for path in self.results:
-            for ea in path:
-                self.unhighlight(ea)
+        for root_node in self.results:
+            bfs_queue = deque()
+            bfs_queue.append(root_node)
+            bfs_visited = set()
+
+            while bfs_queue:
+                curr_node = bfs_queue.popleft()
+                if curr_node.ea in bfs_visited:
+                    continue
+
+                bfs_visited.add(curr_node.ea)
+
+                # Unhighlight/highlight this node in 
+                # the disassembly window
+                if highlight:
+                    self.highlight(curr_node.ea)
+                else:
+                    self.unhighlight(curr_node.ea)
+
+                for child_node in curr_node.xrefs_to:
+                    if child_node.ea not in bfs_visited:
+                        bfs_queue.append(child_node)
+
+            # Clears forward. Some nodes are cleared
+            # twice, but that's alright :-)
+            bfs_queue = deque()
+            bfs_queue.append(root_node)
+            bfs_visited = set()
+
+            while bfs_queue:
+                curr_node = bfs_queue.popleft()
+                if curr_node.ea in bfs_visited:
+                    continue
+
+                bfs_visited.add(curr_node.ea)
+
+                if highlight:
+                    self.highlight(curr_node.ea)
+                else:
+                    self.unhighlight(curr_node.ea)
+
+                for child_node in curr_node.xrefs_from:
+                    if child_node.ea not in bfs_visited:
+                        bfs_queue.append(child_node)
 
 
 class AlleyCatPaths(object):
+    # Graph object is shared between
+    # many instances. I don't know if
+    # in the future, this object is called
+    # asyncronously, but let's hope not :-)
+    graph = None
+
     def _current_function(self):
         function = idaapi.get_func(ida_shims.get_screen_ea())
         return ida_shims.start_ea(function)
-
-    def _find_and_plot_paths(self, sources, targets, klass=AlleyCatFunctionPaths):
+    
+    def _get_xref_results(self, sources, xref_to_depth, xref_from_depth, klass):
         results = []
+        
+        for source in sources:
+            s = time.time()
+            r = klass(source, xref_to_depth, xref_from_depth)
+            e = time.time()
+            print("Found %d paths in %f seconds." % (r.get_npaths(), (e-s)))
+            results.append(r.root)
 
+        return results
+    
+    def _get_startend_results(self, sources, targets, klass):
+        assert targets != None, \
+            ValueError("AlleyCat: STARTEND: targets is empty")
+        
+        results = []
         for target in targets:
             for source in sources:
                 s = time.time()
                 r = klass(source, target)
                 e = time.time()
-                print("Found %d paths in %f seconds." % (r.npaths, (e-s)))
+                print("Found %d paths in %f seconds." % (r.get_npaths(), (e-s)))
 
-                if not r:
+                if r.root == None:
                     name = ida_shims.get_name(target)
                     if not name:
                         name = "0x%X" % target
                     print("No paths found to", name)
                     continue
-                
+            
                 results.append(r.root)
 
-        # TODO: After adding correct stuffs, move back
+        return results
+
+    def _find_and_plot_paths(self, sources, targets=None, 
+                             xref_to_depth=None, 
+                             xref_from_depth=None, 
+                             klass=AlleyCatFunctionPaths):
+        
+        klass_mode = klass.get_mode()
+
         results = []
+        if AlleyCatMode.XREF == klass_mode:
+            results = self._get_xref_results(
+                                sources, xref_to_depth, xref_from_depth, klass
+                            )
+        if AlleyCatMode.STARTEND == klass_mode:
+            results = self._get_startend_results(
+                                sources, targets, klass
+                            )
+
         if not results:
             return
 
-        # Be sure to close any previous graph before creating a new one.
-        # Failure to do so may crash IDA.
-        try:
-            self.graph.Close()
-        except:
-            pass
-
-        self.graph = AlleyCatGraph(results, 'Path Graph')
-        self.graph.Show()
-
+        # Close any previous graph so that it unhighlights
+        # previous paths :)
+        if AlleyCatPaths.graph != None:
+            s = time.time()
+            AlleyCatPaths.graph.clear()
+            AlleyCatPaths.graph.update_results(results)
+            AlleyCatPaths.graph.Refresh()
+            AlleyCatPaths.graph.Show()
+            e = time.time()
+            print("Graph refresh took %f seconds." % (e-s))
+        else:
+            s = time.time()
+            AlleyCatPaths.graph = AlleyCatGraph(results, 'Path Graph')
+            AlleyCatPaths.graph.Show()
+            e = time.time()
+            print("Graph initation took %f seconds." % (e-s))
+        
     def _get_user_selected_functions(self, many=False):
         functions = []
         ea = ida_shims.get_screen_ea()
@@ -708,45 +1095,97 @@ class AlleyCatPaths(object):
                 break
 
         return functions
+    
+    def _get_config_xref_depths(self):
+        xref_to_depth = None
+        xref_from_depth = None
+
+        class XREFSelectForm(ida_kernwin.Form):
+            def __init__(self):
+                self.invert = False
+                F = ida_kernwin.Form
+                F.__init__(
+                    self,
+                    r"""XREF to/from depth
+<##XREF to depth       :{xref_to_depth}>
+<##XREF from depth     :{xref_from_depth}>""", 
+                    {
+                        'xref_to_depth':   F.NumericInput(tp=F.FT_INT64),
+                        'xref_from_depth': F.NumericInput(tp=F.FT_INT64),
+                    }
+                )
+
+        f = XREFSelectForm()
+
+        # Compile (in order to populate the controls)
+        f.Compile()
+
+        f.xref_to_depth.value = -1
+        f.xref_from_depth.value = -1
+
+        # Execute the form
+        ok = f.Execute()
+        if ok == 1:
+            if f.xref_to_depth.value >= 0:
+                xref_to_depth = f.xref_to_depth.value 
+            if f.xref_from_depth.value >= 0:
+                xref_from_depth = f.xref_from_depth.value
+
+        # Dispose the form
+        f.Free()
+
+        return ok, xref_to_depth, xref_from_depth
 
     def FindPathsToCodeBlock(self):
         target = ida_shims.get_screen_ea()
         source = self._current_function()
-
         if source:
             self._find_and_plot_paths(
-                [source], [target], klass=AlleyCatCodePaths)
+                [source], targets=[target], klass=AlleyCatCodePaths)
 
     def FindPathsToMany(self):
         source = self._current_function()
-
         if source:
             targets = self._get_user_selected_functions(many=True)
             if targets:
-                self._find_and_plot_paths([source], targets)
+                self._find_and_plot_paths([source], targets=targets)
 
     def FindPathsFromMany(self):
         target = self._current_function()
-
         if target:
             sources = self._get_user_selected_functions(many=True)
             if sources:
-                self._find_and_plot_paths(sources, [target])
+                self._find_and_plot_paths(sources, targets=[target])
 
+    def FindFunctionXrefs(self):
+        source = self._current_function()
+        
+        ok, xref_to_depth, xref_from_depth = self._get_config_xref_depths()
+        if not ok:
+            return
+        
+        if source:
+            self._find_and_plot_paths(
+                [source], 
+                xref_to_depth=xref_to_depth,
+                xref_from_depth=xref_from_depth,
+                klass=AlleyCatFunctionXrefs
+            )
 
+# --------------------------------------------------------------------
 # Helper functions to execute commands selected from dropdown menus.
-# args parameter is required for IDA version < 7.0
-def find_paths_from_many(arg=None):
+# --------------------------------------------------------------------
+def find_paths_from_many():
     AlleyCatPaths().FindPathsFromMany()
 
-
-def find_paths_to_many(arg=None):
+def find_paths_to_many():
     AlleyCatPaths().FindPathsToMany()
 
-
-def find_paths_to_code_block(args=None):
+def find_paths_to_code_block():
     AlleyCatPaths().FindPathsToCodeBlock()
-
+    
+def find_function_xrefs():
+    AlleyCatPaths().FindFunctionXrefs()
 
 try:
     class ToCurrentFromAction(idaapi.action_handler_t):
@@ -772,6 +1211,7 @@ try:
         def update(self, ctx):
             return idaapi.AST_ENABLE_ALWAYS
 
+
     class InCurrentFunctionToCurrentCodeBlockAction(idaapi.action_handler_t):
         def __init__(self):
             idaapi.action_handler_t.__init__(self)
@@ -783,8 +1223,133 @@ try:
         def update(self, ctx):
             return idaapi.AST_ENABLE_ALWAYS
         
+    class FunctionXrefAction(idaapi.action_handler_t):
+        def __init__(self):
+            idaapi.action_handler_t.__init__(self)
+
+        def activate(self, ctx):
+            find_function_xrefs()
+            return 1
+
+        def update(self, ctx):
+            return idaapi.AST_ENABLE_ALWAYS
+        
 except AttributeError:
     pass
+
+class ActionRegisterer():
+    class ActionConfig:
+        pngbytes2id = {}
+        
+        def __init__(self, name, menu_name, handler,           \
+                           icon:int|bytes,                     \
+                           path_to_in_menu:str|None=None,      \
+                           in_popup_widget_type:int|None=None, \
+                           hotkey="", help=""):
+            
+            self.name = name
+            self.menu_name = menu_name
+            self.handler = handler
+            self.hotkey = hotkey
+            self.help = help
+            self.path_to_in_menu = path_to_in_menu
+            self.in_popup_widget_type = in_popup_widget_type
+            
+            # Either we've got icon ID or
+            # raw PNG bytes :)
+            if isinstance(icon, int):
+                self.icon_id = icon
+            elif not isinstance(icon, bytes):
+                raise ValueError("icon is neither int or PNG bytes :(")
+            elif icon in self.pngbytes2id:
+                self.icon_id = self.pngbytes2id[icon]
+            else:
+                icon_id = ida_kernwin.load_custom_icon(data=icon, format="png")
+                self.pngbytes2id[icon] = self.icon_id = icon_id
+            
+        def register(self) -> bool:
+            ok = idaapi.register_action(idaapi.action_desc_t(
+                self.name,
+                self.menu_name,
+                self.handler,
+                self.hotkey,
+                self.help,
+                self.icon_id,
+            ))
+            
+            if not ok:
+                return False
+            
+            if self.path_to_in_menu != None:
+                idaapi.attach_action_to_menu(
+                    self.path_to_in_menu, self.name, idaapi.SETMENU_APP)
+                
+            return True
+        
+        def detach(self):
+            if self.path_to_in_menu == None:
+                return
+            
+            idaapi.detach_action_from_menu(
+                self.path_to_in_menu, self.name)
+        
+    class RegisterPopupMenuHooks(idaapi.UI_Hooks):
+        def __init__(self, actions:list['ActionRegisterer.ActionConfig'], *args, **kwargs):
+            self.actions = actions
+            super().__init__(*args, **kwargs)
+        
+        def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
+            widget_type = ida_kernwin.get_widget_type(widget)
+            for action in self.actions:
+                if widget_type == action.in_popup_widget_type:
+                    idaapi.attach_action_to_popup(widget, popup_handle, action.name, "")
+    
+    # Defines actions to be registered :)
+    actions = [
+        ActionConfig(
+            name='funcxref_v2:action',
+            menu_name='XREF to/from (interactive)',
+            handler=FunctionXrefAction(),
+            icon=199,
+            path_to_in_menu="View/Graphs/",
+            in_popup_widget_type=ida_kernwin.BWN_DISASM,
+        ),
+        ActionConfig(
+            name="tocurrfrom:action",
+            menu_name='Find paths to the current function from...',
+            handler=ToCurrentFromAction(),
+            icon=199,
+            path_to_in_menu="View/Graphs/",
+            in_popup_widget_type=ida_kernwin.BWN_DISASM,
+        ),
+        ActionConfig(
+            name='fromcurrto:action',
+            menu_name='Find paths from the current function to...',
+            handler=FromCurrentToAction(),
+            icon=199,
+            path_to_in_menu="View/Graphs/",
+            in_popup_widget_type=ida_kernwin.BWN_DISASM,
+        ),
+        ActionConfig(
+            name='currfunccurrblock:action',
+            menu_name='Find paths in the current function to ' \
+                                     'the current code block',
+            handler=InCurrentFunctionToCurrentCodeBlockAction(),
+            icon=199,
+            path_to_in_menu="View/Graphs/",
+            in_popup_widget_type=ida_kernwin.BWN_DISASM,
+        ),
+    ]
+    
+    @staticmethod
+    def init():
+        for action in ActionRegisterer.actions:
+            action.register()
+            
+    @staticmethod
+    def detach():
+        for action in ActionRegisterer.actions:
+            action.detach()
 
 
 class idapathfinder_t(idaapi.plugin_t):
@@ -792,101 +1357,45 @@ class idapathfinder_t(idaapi.plugin_t):
     comment = ''
     help = ''
     wanted_name = 'AlleyCat'
-    wanted_hotkey = ''
-    menu_name = 'View/Graphs/'
-    menu_context = []
-
-    to_from_action_name = 'tocurrfrom:action'
-    from_to_action_name = 'fromcurrto:action'
-    curr_func_curr_block_action_name = 'currfunccurrblock:action'
-
-    to_from_menu_name = 'Find paths to the current function from...'
-    from_to_menu_name = 'Find paths from the current function to...'
-    curr_func_curr_block_menu_name = 'Find paths in the current function to ' \
-                                     'the current code block'
 
     def init(self):
-        if idaapi.IDA_SDK_VERSION >= 700:
-            # Add ALLEYCAT_LIMIT variable to the global namespace so it can be
-            # accessed from the IDA python terminal.
-            global ALLEYCAT_LIMIT
-            add_to_namespace(
-                '__main__', 'alleycat', 'ALLEYCAT_LIMIT', ALLEYCAT_LIMIT)
+        # Add ALLEYCAT_MEMLIMIT variable to the global namespace so it can be
+        # accessed from the IDA python terminal.
+        global ALLEYCAT_MEMLIMIT
+        add_to_namespace(
+            '__main__', 'alleycat', 'ALLEYCAT_MEMLIMIT', ALLEYCAT_MEMLIMIT)
 
-            # Add functions to global namespace.
-            add_to_namespace(
-                '__main__', 'alleycat', 'AlleyCatFunctionPaths',
-                AlleyCatFunctionPaths)
-            add_to_namespace(
-                '__main__', 'alleycat', 'AlleyCatCodePaths', AlleyCatCodePaths)
-            add_to_namespace(
-                '__main__', 'alleycat', 'AlleyCatGraph', AlleyCatGraph)
-
-            to_curr_from_desc = idaapi.action_desc_t(
-                self.to_from_action_name, self.to_from_menu_name,
-                ToCurrentFromAction(), self.wanted_hotkey,
-                'Find paths to the current function from...', 199)
-
-            from_curr_to_desc = idaapi.action_desc_t(
-                self.from_to_action_name, self.from_to_menu_name,
-                FromCurrentToAction(), self.wanted_hotkey,
-                'Find paths from the current function to...', 199)
-
-            curr_func_to_block_desc = idaapi.action_desc_t(
-                self.curr_func_curr_block_action_name,
-                self.curr_func_curr_block_menu_name,
-                InCurrentFunctionToCurrentCodeBlockAction(),
-                self.wanted_hotkey,
-                'Find paths in the current function to the current code block',
-                199)
-
-            idaapi.register_action(to_curr_from_desc)
-            idaapi.register_action(from_curr_to_desc)
-            idaapi.register_action(curr_func_to_block_desc)
-
-            idaapi.attach_action_to_menu(
-                self.menu_name, self.to_from_action_name, idaapi.SETMENU_APP)
-            idaapi.attach_action_to_menu(
-                self.menu_name, self.from_to_action_name, idaapi.SETMENU_APP)
-            idaapi.attach_action_to_menu(
-                self.menu_name, self.curr_func_curr_block_action_name,
-                idaapi.SETMENU_APP)
-
-        else:
-            self.menu_context.append(
-                idaapi.add_menu_item(
-                    self.menu_name, self.to_from_menu_name, "", 0,
-                    find_paths_from_many, (None,)))
-
-            self.menu_context.append(
-                idaapi.add_menu_item(
-                    self.menu_name, self.from_to_menu_name, "", 0,
-                    find_paths_to_many, (None,)))
-
-            self.menu_context.append(
-                idaapi.add_menu_item(
-                    self.menu_name, self.curr_func_curr_block_menu_name, "", 0,
-                    find_paths_to_code_block, (None,)))
-
+        # Add functions to global namespace.
+        add_to_namespace(
+            '__main__', 'alleycat', 'AlleyCatFunctionXrefs',
+            AlleyCatFunctionXrefs)
+        add_to_namespace(
+            '__main__', 'alleycat', 'AlleyCatFunctionPaths',
+            AlleyCatFunctionPaths)
+        add_to_namespace(
+            '__main__', 'alleycat', 'AlleyCatCodePaths', AlleyCatCodePaths)
+        add_to_namespace(
+            '__main__', 'alleycat', 'AlleyCatGraph', AlleyCatGraph)
+        add_to_namespace(
+            '__main__', 'alleycat', 'AlleyCatPaths', AlleyCatPaths)
+                
         return idaapi.PLUGIN_KEEP
 
     def term(self):
-        if idaapi.IDA_SDK_VERSION >= 700:
-            idaapi.detach_action_from_menu(
-                self.menu_name, self.to_from_action_name)
-            idaapi.detach_action_from_menu(
-                self.menu_name, self.from_to_action_name)
-            idaapi.detach_action_from_menu(
-                self.menu_name, self.curr_func_curr_block_action_name)
-        else:
-            for context in self.menu_context:
-                idaapi.del_menu_item(context)
+        ActionRegisterer.detach()
         return None
 
     def run(self, arg):
         pass
 
-
 def PLUGIN_ENTRY():
     return idapathfinder_t()
 
+ActionRegisterer.init()
+
+hooks = [
+    ActionRegisterer.RegisterPopupMenuHooks(ActionRegisterer.actions)
+]
+
+for hook in hooks:
+    hook.hook()
