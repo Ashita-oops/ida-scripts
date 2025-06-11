@@ -784,7 +784,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
             node_ea = self.id2gnodes[node_id].ea
             
             updated_node_label = AlleyCatUtils.get_name_by_ea(node_ea) 
-            if updated_node_label != self[node_id]:
+            if updated_node_label != self.id2gnodes[node_id].text:
                 self.id2gnodes[node_id].text = updated_node_label
         
         return True
