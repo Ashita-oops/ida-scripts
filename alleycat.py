@@ -101,6 +101,102 @@ class AlleyCatUtils(object):
                 break
 
         return xrefs
+    
+# ---------------------------------------------------------------------
+#
+# This code implements BFS (breath first search) to find paths in this
+# graph. While it's quite fast, there's no guarantee that it will keep
+# finding children nodes out in Antartica or not, so a memory limit
+# is placed in case the memory runs out.
+#
+# This variable is global so it's easy to change from the IDAPython
+# prompt.
+#
+# ---------------------------------------------------------------------
+
+class AlleyCatUtils(object):
+    @staticmethod
+    def get_ea_by_name(name):
+        '''
+        Get the address of a location by name.
+
+        @name - Location name
+
+        Returns the address of the named location, or idc.BADADDR on failure.
+        '''
+        # This allows support of the function offset style names (e.g., main+0C)
+        ea = 0
+        if '+' in name:
+            (func_name, offset) = name.split('+')
+            base_ea = ida_shims.get_name_ea_simple(func_name)
+            if base_ea != idc.BADADDR:
+                try:
+                    ea = base_ea + int(offset, 16)
+                except:
+                    ea = idc.BADADDR
+        else:
+            ea = ida_shims.get_name_ea_simple(name)
+            if ea == idc.BADADDR:
+                try:
+                    ea = int(name, 0)
+                except:
+                    ea = idc.BADADDR
+
+        return ea
+
+    @staticmethod
+    def get_name_by_ea(ea):
+        '''
+        Get the name of the specified address.
+
+        @ea - Address.
+
+        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
+        0xXXXXXXXX.
+        '''
+        name = ida_shims.get_name(ea)
+        if name:
+            return name
+        name = ida_shims.get_func_off_str(ea)
+        if name:
+            return name
+        return "0x%X" % ea
+    
+
+    @staticmethod
+    def xrefs_from(ea):
+        '''
+        Find all functions the function containing <ea> calling to.
+
+        @ea - Address.
+
+        Returns a list of addresses.
+        '''
+
+        func = idaapi.get_func(ea)
+        if not func:
+            return []
+
+        start_ea = ida_shims.start_ea(func)
+        end_ea = ida_shims.end_ea(func)
+        if start_ea == idc.BADADDR or end_ea == idc.BADADDR:
+            return []
+
+        xrefs = []
+        
+        ea = start_ea
+        while ea < end_ea:
+            for xref in idautils.XrefsFrom(ea):
+                # Note: A self-reference function will fail this
+                # check. This works best for a normal program. 
+                if end_ea <= xref.to or start_ea >= xref.to:
+                    xrefs.append(xref)
+            
+            ea = ida_shims.next_head(ea)
+            if ea == idc.BADADDR:
+                break
+
+        return xrefs
 
 def add_to_namespace(namespace, source, name, variable):
     '''
