@@ -13,7 +13,9 @@ if idaapi.IDA_SDK_VERSION < 750:
     raise ValueError("Shoo shoo: IDA_SDK_VERSION = %d < 750" % idaapi.IDA_SDK_VERSION)
 
 # ---------------------------------------------------------------------
+#
 # This part contains common functions used by the plugin.
+#
 # ---------------------------------------------------------------------
 
 class AlleyCatUtils(object):
@@ -90,7 +92,7 @@ class AlleyCatUtils(object):
         while ea < end_ea:
             for xref in idautils.XrefsFrom(ea):
                 # Note: A self-reference function will fail this
-                # check. This works best for a normal function. 
+                # check. This works best for a normal program. 
                 if end_ea <= xref.to or start_ea >= xref.to:
                     xrefs.append(xref)
             
@@ -100,37 +102,8 @@ class AlleyCatUtils(object):
 
         return xrefs
     
-class AlleyCatHotkey(object):
-    hotkey_funcs = {}
-    hotkey_ctxs = defaultdict(None)
-    
-    @classmethod
-    def addfunc(cls, hotkey, callable):
-        if hotkey not in cls.hotkey_funcs:
-            cls.hotkey_funcs[hotkey] = {}
-            
-            def hotkey_fn():
-                for fn in cls.hotkey_funcs[hotkey].values():
-                    fn()
-            
-            cls.hotkey_ctxs[hotkey] = ida_kernwin.add_hotkey(hotkey, hotkey_fn) 
-    
-        func_id = ''
-        while not func_id or func_id in cls.hotkey_funcs[hotkey]:
-            func_id = random.randbytes(4).hex()
-        
-        # func_id may not be unique with different
-        # hotkey... But eh, it works :)
-        cls.hotkey_funcs[hotkey][func_id] = callable
-        
-        return func_id
-    
-    @classmethod
-    def delfunc(cls, hotkey, func_id):
-        if hotkey in cls.hotkey_funcs:
-            cls.hotkey_funcs[hotkey].pop(func_id, None)
-    
 # ---------------------------------------------------------------------
+#
 # This code implements BFS (breath first search) to find paths in this
 # graph. While it's quite fast, there's no guarantee that it will keep
 # finding children nodes out in Antartica or not, so a memory limit
@@ -138,6 +111,7 @@ class AlleyCatHotkey(object):
 #
 # This variable is global so it's easy to change from the IDAPython
 # prompt.
+#
 # ---------------------------------------------------------------------
 
 ALLEYCAT_MEMLIMIT = 10000
@@ -692,11 +666,6 @@ class AlleyCatGraph(idaapi.GraphViewer):
         
     def add_command(self, title, shortcut):
         cmd_id = self.AddCommand(title, shortcut)
-        
-        if shortcut != "":
-            func_id = AlleyCatHotkey.addfunc(shortcut, lambda: self.OnCommand(cmd_id))
-            self.hotkey_func_ids[shortcut].append(func_id)
-        
         return cmd_id
 
     def Show(self):
@@ -988,6 +957,9 @@ class AlleyCatGraph(idaapi.GraphViewer):
         if not func:
             return
         
+        # TODO: slow lookup implementation.
+        # All nodes must be running again and again,
+        # making graph rendering slow...
         for block in idaapi.FlowChart(func):
             block_start_ea = ida_shims.start_ea(block)
             block_end_ea = ida_shims.end_ea(block)
