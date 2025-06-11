@@ -630,28 +630,42 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def __init__(self, results, title="AlleyCat Graph V2"):
         idaapi.GraphViewer.__init__(self, title)
         
+        # Important variables deciding how
+        # to update graph contents smoothly.
         self.soft_refresh = False
         self.force_refresh = True
         self.results = results
         self.last_results_timestamps = [root_node.timestamp for root_node in results]
 
+        # Info caches.
         self.ea2id: dict[int,int] = {}
         self.id2gnodes: dict[int,'AlleyCatGraphicNode'] = {}
 
-        # So we can click to it again to switch to another
+        # We can click the same node again
+        # to switch to another child in the disassembly
+        # graph.
         self.last_focused_node_id = None
         self.last_focused_node_xref_index = -1
         self.last_focused_node_xref_locations = []
 
+        # Implementing node inclusion/exclusion
+        # on the graph. Note: It's currently
+        # useless.
         self.history = AlleyCatGraphHistory()
         self.last_history_index = self.history.history_index
         self.include_on_click = False
         self.exclude_on_click = False
         
+        # If set to False, we need to double click
+        # to jump into node, else we only need
+        # one click
         self.focus_on_click = True
 
+        # If set to True, all corresponding
+        # disassembly lines are highlighted.
         self.is_highlighting_path = True
 
+        # List of command id for the menu items.
         # self.cmd_undo = None
         # self.cmd_redo = None
         # self.cmd_exclude = None
@@ -697,11 +711,11 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def add_node(self, node:'AlleyCatPathNode') -> int:
         gnode = AlleyCatGraphicNode(node)
         
-        gnode_id = super().AddNode(gnode.text)
-        self.ea2id[node.ea] = gnode_id
-        self.id2gnodes[gnode_id] = gnode
+        node_id = super().AddNode(gnode.text)
+        self.ea2id[node.ea] = node_id
+        self.id2gnodes[node_id] = gnode
         
-        return gnode_id
+        return node_id
     
     def add_edge(self, src_node_id, dest_node_id):
         self.id2gnodes[src_node_id].add_connection(dest_node_id)
@@ -754,6 +768,9 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # Setting this only is already enough
         # to trigger clear focus :)
         self.last_focused_node_id = None
+        
+        # You always need to highlight first
+        self.is_highlighting_path = True
         
         # TODO: implement excludes & includes
         # includes = self.history.get_includes()
