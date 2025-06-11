@@ -101,6 +101,25 @@ class AlleyCatUtils(object):
                 break
 
         return xrefs
+
+def add_to_namespace(namespace, source, name, variable):
+    '''
+    Add a variable to a different namespace, likely __main__.
+    '''
+    import importlib
+
+    importer_module = sys.modules[namespace]
+    if source in list(sys.modules.keys()):
+        if not (sys.version_info.major == 3 and sys.version_info.minor >= 4):
+            import imp
+            imp.reload(sys.modules[source])
+        else:
+            importlib.reload(sys.modules[source])
+    else:
+        m = importlib.import_module(source, None)
+        sys.modules[source] = m
+
+    setattr(importer_module, name, variable)
     
 # ---------------------------------------------------------------------
 #
@@ -124,25 +143,6 @@ class AlleyCatMode:
     '''
     STARTEND = 1
     XREF     = 2
-
-def add_to_namespace(namespace, source, name, variable):
-    '''
-    Add a variable to a different namespace, likely __main__.
-    '''
-    import importlib
-
-    importer_module = sys.modules[namespace]
-    if source in list(sys.modules.keys()):
-        if not (sys.version_info.major == 3 and sys.version_info.minor >= 4):
-            import imp
-            imp.reload(sys.modules[source])
-        else:
-            importlib.reload(sys.modules[source])
-    else:
-        m = importlib.import_module(source, None)
-        sys.modules[source] = m
-
-    setattr(importer_module, name, variable)
 
 class AlleyCatException(Exception):
     pass
@@ -1367,7 +1367,8 @@ class idapathfinder_t(idaapi.plugin_t):
         # accessed from the IDA python terminal.
         global ALLEYCAT_MEMLIMIT
         add_to_namespace(
-            '__main__', 'alleycat', 'ALLEYCAT_MEMLIMIT', ALLEYCAT_MEMLIMIT)
+            '__main__', 'alleycat', 'ALLEYCAT_MEMLIMIT', 
+            ALLEYCAT_MEMLIMIT)
 
         # Add functions to global namespace.
         add_to_namespace(
