@@ -64,6 +64,41 @@ class AlleyCatUtils(object):
             return name
         return "0x%X" % ea
     
+
+    @staticmethod
+    def xrefs_from(ea):
+        '''
+        Find all functions the function containing <ea> calling to.
+
+        @ea - Address.
+
+        Returns a list of addresses.
+        '''
+
+        func = idaapi.get_func(ea)
+        if not func:
+            return []
+
+        start_ea = ida_shims.start_ea(func)
+        end_ea = ida_shims.end_ea(func)
+        if start_ea == idc.BADADDR or end_ea == idc.BADADDR:
+            return []
+
+        xrefs = []
+        
+        ea = start_ea
+        while ea < end_ea:
+            for xref in idautils.XrefsFrom(ea):
+                # Note: A self-reference function will fail this
+                # check. This works best for a normal function. 
+                if end_ea <= xref.to or start_ea >= xref.to:
+                    xrefs.append(xref)
+            
+            ea = ida_shims.next_head(ea)
+            if ea == idc.BADADDR:
+                break
+
+        return xrefs
     
 class AlleyCatHotkey(object):
     hotkey_funcs = {}
@@ -182,7 +217,7 @@ class AlleyCatPathNode(object):
     def is_outer(self):
         return len(self.xrefs_from) == 0 and len(self.xrefs_to) == 0 
         
-class AlleyCatCommon(object):
+class AlleyCatBase(object):
     '''
     Class which includes common functions
     '''
@@ -205,7 +240,7 @@ class AlleyCatCommon(object):
     def get_npaths(self):
         return -1
 
-class AlleyCatSE(AlleyCatCommon):
+class AlleyCatSE(AlleyCatBase):
     '''
     Class which resolves code paths from starting point to end. This is where most of the work is done.
     '''
@@ -393,7 +428,7 @@ class AlleyCatCodePaths(AlleyCatSE):
         return None
     
 
-class AlleyCatXR(AlleyCatCommon):
+class AlleyCatXR(AlleyCatBase):
     '''
     Class which computes path from and to of a graph, with a choice :)
     Mostly copied from AlleyCat :'3
@@ -429,23 +464,6 @@ class AlleyCatXR(AlleyCatCommon):
     def _set_root(self, node):
         self.root = node
 
-    @staticmethod
-    def _xrefs_from(ea):
-        func = idaapi.get_func(ea)
-        if not func:
-            return []
-
-        start_ea = ida_shims.start_ea(func)
-        end_ea = ida_shims.end_ea(func)
-
-        xrefs = []
-        for ea in range(start_ea, end_ea):
-            for xref in idautils.XrefsFrom(ea):
-                if end_ea <= xref.to or start_ea >= xref.to:
-                    xrefs.append(xref)
-
-        return xrefs
-
     def _build_paths(self):
         start_node = AlleyCatPathNode(ea=self.start, is_target=True)
         self.nodes[self.start] = start_node
@@ -476,7 +494,7 @@ class AlleyCatXR(AlleyCatCommon):
             # if fwd, search forward nodes,
             # if bck, search backward nodes,
             if fwd:
-                xrefs = self._xrefs_from(node.ea)
+                xrefs = AlleyCatUtils.xrefs_from(node.ea)
             else:
                 xrefs = idautils.XrefsTo(node.ea)
 
@@ -913,7 +931,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
                         continue
 
                     for xref in idautils.XrefsTo(edge_node_ea):
-                        if self.match_xref_source(xref, node_ea):
+                        if self._match_xref_source(xref, node_ea):
                             self.last_focused_node_xref_locations.append((xref.frm, edge_node_ea))
 
             if self.last_focused_node_xref_locations:
@@ -960,7 +978,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
         
         self.toggle_highlight_all(highlight=False)
 
-    def match_xref_source(self, xref, source):
+    def _match_xref_source(self, xref, source):
         return ((xref.type != idc.fl_F) and
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
 
