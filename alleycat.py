@@ -1100,6 +1100,7 @@ class AlleyCatPaths(object):
             s = time.time()
             graph = AlleyCatGraph(results, 'Path Graph')
             graph.Show()
+            self.__class__.graph = graph
             e = time.time()
             print("Graph initation took %f seconds." % (e-s))
         
