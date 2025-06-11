@@ -4,15 +4,106 @@ import time
 import idaapi
 import idautils
 import ida_kernwin
-import ida_graph
+import random
 
 from shims import ida_shims
 from collections import deque, defaultdict
 
-if idaapi.IDA_SDK_VERSION < 700:
-    raise ValueError("Shoo shoo: IDA_SDK_VERSION = %d < 700" % idaapi.IDA_SDK_VERSION)
+if idaapi.IDA_SDK_VERSION < 750:
+    raise ValueError("Shoo shoo: IDA_SDK_VERSION = %d < 750" % idaapi.IDA_SDK_VERSION)
 
 # ---------------------------------------------------------------------
+#
+# This part contains common functions used by the plugin.
+#
+# ---------------------------------------------------------------------
+
+class AlleyCatUtils(object):
+    @staticmethod
+    def get_ea_by_name(name):
+        '''
+        Get the address of a location by name.
+
+        @name - Location name
+
+        Returns the address of the named location, or idc.BADADDR on failure.
+        '''
+        # This allows support of the function offset style names (e.g., main+0C)
+        ea = 0
+        if '+' in name:
+            (func_name, offset) = name.split('+')
+            base_ea = ida_shims.get_name_ea_simple(func_name)
+            if base_ea != idc.BADADDR:
+                try:
+                    ea = base_ea + int(offset, 16)
+                except:
+                    ea = idc.BADADDR
+        else:
+            ea = ida_shims.get_name_ea_simple(name)
+            if ea == idc.BADADDR:
+                try:
+                    ea = int(name, 0)
+                except:
+                    ea = idc.BADADDR
+
+        return ea
+
+    @staticmethod
+    def get_name_by_ea(ea):
+        '''
+        Get the name of the specified address.
+
+        @ea - Address.
+
+        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
+        0xXXXXXXXX.
+        '''
+        name = ida_shims.get_name(ea)
+        if name:
+            return name
+        name = ida_shims.get_func_off_str(ea)
+        if name:
+            return name
+        return "0x%X" % ea
+    
+
+    @staticmethod
+    def xrefs_from(ea):
+        '''
+        Find all functions the function containing <ea> calling to.
+
+        @ea - Address.
+
+        Returns a list of addresses.
+        '''
+
+        func = idaapi.get_func(ea)
+        if not func:
+            return []
+
+        start_ea = ida_shims.start_ea(func)
+        end_ea = ida_shims.end_ea(func)
+        if start_ea == idc.BADADDR or end_ea == idc.BADADDR:
+            return []
+
+        xrefs = []
+        
+        ea = start_ea
+        while ea < end_ea:
+            for xref in idautils.XrefsFrom(ea):
+                # Note: A self-reference function will fail this
+                # check. This works best for a normal program. 
+                if end_ea <= xref.to or start_ea >= xref.to:
+                    xrefs.append(xref)
+            
+            ea = ida_shims.next_head(ea)
+            if ea == idc.BADADDR:
+                break
+
+        return xrefs
+    
+# ---------------------------------------------------------------------
+#
 # This code implements BFS (breath first search) to find paths in this
 # graph. While it's quite fast, there's no guarantee that it will keep
 # finding children nodes out in Antartica or not, so a memory limit
@@ -20,6 +111,7 @@ if idaapi.IDA_SDK_VERSION < 700:
 #
 # This variable is global so it's easy to change from the IDAPython
 # prompt.
+#
 # ---------------------------------------------------------------------
 
 ALLEYCAT_MEMLIMIT = 10000
@@ -98,56 +190,8 @@ class AlleyCatPathNode(object):
         return self.status & self.IS_EDGE != 0
     def is_outer(self):
         return len(self.xrefs_from) == 0 and len(self.xrefs_to) == 0 
-    
-class AlleyCatUtils(object):
-    @staticmethod
-    def get_ea_by_name(name):
-        '''
-        Get the address of a location by name.
-
-        @name - Location name
-
-        Returns the address of the named location, or idc.BADADDR on failure.
-        '''
-        # This allows support of the function offset style names (e.g., main+0C)
-        ea = 0
-        if '+' in name:
-            (func_name, offset) = name.split('+')
-            base_ea = ida_shims.get_name_ea_simple(func_name)
-            if base_ea != idc.BADADDR:
-                try:
-                    ea = base_ea + int(offset, 16)
-                except:
-                    ea = idc.BADADDR
-        else:
-            ea = ida_shims.get_name_ea_simple(name)
-            if ea == idc.BADADDR:
-                try:
-                    ea = int(name, 0)
-                except:
-                    ea = idc.BADADDR
-
-        return ea
-
-    @staticmethod
-    def get_name_by_ea(ea):
-        '''
-        Get the name of the specified address.
-
-        @ea - Address.
-
-        Returns a name for the address, one of idc.Name, idc.GetFuncOffset or
-        0xXXXXXXXX.
-        '''
-        name = ida_shims.get_name(ea)
-        if name:
-            return name
-        name = ida_shims.get_func_off_str(ea)
-        if name:
-            return name
-        return "0x%X" % ea
-
-class AlleyCatCommon(object):
+        
+class AlleyCatBase(object):
     '''
     Class which includes common functions
     '''
@@ -170,7 +214,7 @@ class AlleyCatCommon(object):
     def get_npaths(self):
         return -1
 
-class AlleyCatSE(AlleyCatCommon):
+class AlleyCatSE(AlleyCatBase):
     '''
     Class which resolves code paths from starting point to end. This is where most of the work is done.
     '''
@@ -358,7 +402,7 @@ class AlleyCatCodePaths(AlleyCatSE):
         return None
     
 
-class AlleyCatXR(AlleyCatCommon):
+class AlleyCatXR(AlleyCatBase):
     '''
     Class which computes path from and to of a graph, with a choice :)
     Mostly copied from AlleyCat :'3
@@ -394,23 +438,6 @@ class AlleyCatXR(AlleyCatCommon):
     def _set_root(self, node):
         self.root = node
 
-    @staticmethod
-    def _xrefs_from(ea):
-        func = idaapi.get_func(ea)
-        if not func:
-            return []
-
-        start_ea = ida_shims.start_ea(func)
-        end_ea = ida_shims.end_ea(func)
-
-        xrefs = []
-        for ea in range(start_ea, end_ea):
-            for xref in idautils.XrefsFrom(ea):
-                if end_ea <= xref.to or start_ea >= xref.to:
-                    xrefs.append(xref)
-
-        return xrefs
-
     def _build_paths(self):
         start_node = AlleyCatPathNode(ea=self.start, is_target=True)
         self.nodes[self.start] = start_node
@@ -441,7 +468,7 @@ class AlleyCatXR(AlleyCatCommon):
             # if fwd, search forward nodes,
             # if bck, search backward nodes,
             if fwd:
-                xrefs = self._xrefs_from(node.ea)
+                xrefs = AlleyCatUtils.xrefs_from(node.ea)
             else:
                 xrefs = idautils.XrefsTo(node.ea)
 
@@ -602,6 +629,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
     '''
     def __init__(self, results, title="AlleyCat Graph V2"):
         idaapi.GraphViewer.__init__(self, title)
+        
         self.soft_refresh = False
         self.force_refresh = True
         self.results = results
@@ -631,6 +659,10 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.cmd_refresh = None
         self.cmd_toggle_highlight = None
         self.cmd_toggle_focus_on_click = None
+        
+    def add_command(self, title, shortcut):
+        cmd_id = self.AddCommand(title, shortcut)
+        return cmd_id
 
     def Show(self):
         '''
@@ -640,20 +672,19 @@ class AlleyCatGraph(idaapi.GraphViewer):
         '''
         if not idaapi.GraphViewer.Show(self):
             return False
-        else:
-            # TODO: implement UI hooks to toggle shortcuts :')
+        
+        # self.cmd_undo = self.AddCommand("Undo", "")
+        # self.cmd_redo = self.AddCommand("Redo", "")
+        # self.cmd_exclude = self.AddCommand("Exclude node", "")
+        # self.cmd_include = self.AddCommand("Include node", "")
+        
+        self.cmd_refresh = self.add_command("Refresh graph", "R")
+        self.cmd_toggle_highlight = self.add_command(
+            "Toggle highlight/un-highlight all paths", "H")
+        self.cmd_toggle_focus_on_click = self.add_command(
+            "Toggle focus to address on click", "")
 
-            # self.cmd_undo = self.AddCommand("Undo", "")
-            # self.cmd_redo = self.AddCommand("Redo", "")
-            # self.cmd_exclude = self.AddCommand("Exclude node", "")
-            # self.cmd_include = self.AddCommand("Include node", "")
-            self.cmd_refresh = self.AddCommand("Refresh graph", "R")
-            self.cmd_toggle_highlight = self.AddCommand(
-                "Toggle highlight/un-highlight all paths", "H")
-            self.cmd_toggle_focus_on_click = self.AddCommand(
-                "Toggle focus to address on click", "")
-
-            return True
+        return True
         
     def clear(self):
         self.ea2id = {}
@@ -807,7 +838,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
         return "%s\n%s\n%s" % (self[src].center(displen), 
                                '↓'.center(displen), 
                                self[dst].center(displen))
-
+        
     def OnCommand(self, cmd_id):        
         # if self.cmd_undo == cmd_id:
         #     if self.include_on_click or self.exclude_on_click:
@@ -865,7 +896,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
                         continue
 
                     for xref in idautils.XrefsTo(edge_node_ea):
-                        if self.match_xref_source(xref, node_ea):
+                        if self._match_xref_source(xref, node_ea):
                             self.last_focused_node_xref_locations.append((xref.frm, edge_node_ea))
 
             if self.last_focused_node_xref_locations:
@@ -908,7 +939,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def OnClose(self):
         self.toggle_highlight_all(highlight=False)
 
-    def match_xref_source(self, xref, source):
+    def _match_xref_source(self, xref, source):
         return ((xref.type != idc.fl_F) and
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
 
@@ -918,6 +949,9 @@ class AlleyCatGraph(idaapi.GraphViewer):
         if not func:
             return
         
+        # TODO: slow lookup implementation.
+        # All nodes must be running again and again,
+        # making graph rendering slow...
         for block in idaapi.FlowChart(func):
             block_start_ea = ida_shims.start_ea(block)
             block_end_ea = ida_shims.end_ea(block)
@@ -1053,19 +1087,19 @@ class AlleyCatPaths(object):
 
         # Close any previous graph so that it unhighlights
         # previous paths :)
-        if AlleyCatPaths.graph != None:
+        graph = self.__class__.graph
+        if graph != None:
             s = time.time()
-            AlleyCatPaths.graph.clear()
-            AlleyCatPaths.graph.update_results(results)
-            AlleyCatPaths.graph.Refresh()
-            AlleyCatPaths.graph.Show()
+            graph.clear()
+            graph.update_results(results)
+            graph.Refresh()
+            graph.Show()
             e = time.time()
             print("Graph refresh took %f seconds." % (e-s))
         else:
             s = time.time()
-            AlleyCatPaths.graph = AlleyCatGraph(results, 'Path Graph')
-            AlleyCatPaths.graph.Show()
-            e = time.time()
+            self.__class__.graph = AlleyCatGraph(results, 'Path Graph')
+            self.__class__.graph.Show()
             print("Graph initation took %f seconds." % (e-s))
         
     def _get_user_selected_functions(self, many=False):
@@ -1173,7 +1207,9 @@ class AlleyCatPaths(object):
             )
 
 # --------------------------------------------------------------------
+#
 # Helper functions to execute commands selected from dropdown menus.
+#
 # --------------------------------------------------------------------
 def find_paths_from_many():
     AlleyCatPaths().FindPathsFromMany()
@@ -1341,14 +1377,14 @@ class ActionRegisterer():
         ),
     ]
     
-    @staticmethod
-    def init():
-        for action in ActionRegisterer.actions:
+    @classmethod
+    def init(cls):
+        for action in cls.actions:
             action.register()
             
-    @staticmethod
-    def detach():
-        for action in ActionRegisterer.actions:
+    @classmethod
+    def detach(cls):
+        for action in cls.actions:
             action.detach()
 
 
@@ -1367,17 +1403,23 @@ class idapathfinder_t(idaapi.plugin_t):
 
         # Add functions to global namespace.
         add_to_namespace(
+            '__main__', 'alleycat', 'AlleyCatUtils',
+            AlleyCatUtils)
+        add_to_namespace(
             '__main__', 'alleycat', 'AlleyCatFunctionXrefs',
             AlleyCatFunctionXrefs)
         add_to_namespace(
             '__main__', 'alleycat', 'AlleyCatFunctionPaths',
             AlleyCatFunctionPaths)
         add_to_namespace(
-            '__main__', 'alleycat', 'AlleyCatCodePaths', AlleyCatCodePaths)
+            '__main__', 'alleycat', 'AlleyCatCodePaths', 
+            AlleyCatCodePaths)
         add_to_namespace(
-            '__main__', 'alleycat', 'AlleyCatGraph', AlleyCatGraph)
+            '__main__', 'alleycat', 'AlleyCatGraph', 
+            AlleyCatGraph)
         add_to_namespace(
-            '__main__', 'alleycat', 'AlleyCatPaths', AlleyCatPaths)
+            '__main__', 'alleycat', 'AlleyCatPaths', 
+            AlleyCatPaths)
                 
         return idaapi.PLUGIN_KEEP
 
