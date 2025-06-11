@@ -964,36 +964,55 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def _match_xref_source(self, xref, source):
         return ((xref.type != idc.fl_F) and
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
+        
+    def _colorize_ea_range(self, start_ea, end_ea, color):
+        if not start_ea < end_ea:
+            return 
+        
+        ea = start_ea
+        while ea < end_ea:
+            idaapi.set_item_color(ea, color)
+            ea = ida_shims.next_head(ea)
 
     def colorize_node(self, ea, color):
-        start_ea, end_ea = self.colorize_cache_func_eas
+        func_start_ea, func_end_ea = self.colorize_cache_func_eas
         
-        if start_ea == None or not (start_ea <= ea < end_ea):
+        if func_start_ea == None or not (func_start_ea <= ea < func_end_ea):
             func = idaapi.get_func(ea)
             if not func:
                 return
             
+            func_start_ea = ida_shims.start_ea(func)
+            func_end_ea = ida_shims.end_ea(func)
+            
+            # Don't cache on first block. This will dampen
+            # the performance during computing function 
+            # relationships.
+            if func_start_ea == ea:
+                for block in idaapi.FlowChart(func):
+                    block_start_ea = ida_shims.start_ea(block)
+                    block_end_ea = ida_shims.end_ea(block)
+                    self._colorize_ea_range(block_start_ea, block_end_ea, color)
+                    return
+            
+            # Only start caching when we're trying to
+            # look at second block. Useful as
+            # we only highlight first block when
+            # inspecting function relationships.
             self.colorize_cache_block_eas = []
-            self.colorize_cache_func_eas = (ida_shims.start_ea(func), 
-                                            ida_shims.end_ea(func))
+            self.colorize_cache_func_eas = (func_start_ea, func_end_ea)
             
             for block in idaapi.FlowChart(func):
                 block_start_ea = ida_shims.start_ea(block)
                 block_end_ea = ida_shims.end_ea(block)
-                self.colorize_cache_block_eas.append((block_start_ea,
-                                                      block_end_ea))
+                self.colorize_cache_block_eas.append((block_start_ea, block_end_ea))
                 self.colorize_cache_block_eas.sort()
         
         # Search for block took O(logN)
         pi = bisect.bisect_left(self.colorize_cache_block_eas, ea, 
                                 key=lambda block_eas:block_eas[0])
-        
         block_start_ea, block_end_ea = self.colorize_cache_block_eas[pi]
-        if block_start_ea <= ea and block_end_ea > ea:
-            ea = block_start_ea
-            while ea < block_end_ea:
-                idaapi.set_item_color(ea, color)
-                ea = ida_shims.next_head(ea)
+        self._colorize_ea_range(block_start_ea, block_end_ea, color)
         
 
     def highlight(self, ea):
