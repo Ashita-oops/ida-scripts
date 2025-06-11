@@ -1098,9 +1098,8 @@ class AlleyCatPaths(object):
             print("Graph refresh took %f seconds." % (e-s))
         else:
             s = time.time()
-            graph = AlleyCatGraph(results, 'Path Graph')
-            graph.Show()
-            self.__class__.graph = graph
+            self.__class__.graph = AlleyCatGraph(results, 'Path Graph')
+            self.__class__.graph.Show()
             e = time.time()
             print("Graph initation took %f seconds." % (e-s))
         
@@ -1209,7 +1208,9 @@ class AlleyCatPaths(object):
             )
 
 # --------------------------------------------------------------------
+#
 # Helper functions to execute commands selected from dropdown menus.
+#
 # --------------------------------------------------------------------
 def find_paths_from_many():
     AlleyCatPaths().FindPathsFromMany()
@@ -1223,57 +1224,20 @@ def find_paths_to_code_block():
 def find_function_xrefs():
     AlleyCatPaths().FindFunctionXrefs()
 
-try:
-    class ToCurrentFromAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_paths_from_many()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-
-
-    class FromCurrentToAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_paths_to_many()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-
-
-    class InCurrentFunctionToCurrentCodeBlockAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_paths_to_code_block()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-        
-    class FunctionXrefAction(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
-
-        def activate(self, ctx):
-            find_function_xrefs()
-            return 1
-
-        def update(self, ctx):
-            return idaapi.AST_ENABLE_ALWAYS
-        
-except AttributeError:
-    pass
 
 class ActionRegisterer():
+    class DynamicAction(idaapi.action_handler_t):
+        def __init__(self, handler):
+            idaapi.action_handler_t.__init__(self)
+            self.handler = handler
+
+        def activate(self, ctx):
+            self.handler()
+            return 1
+
+        def update(self, ctx):
+            return idaapi.AST_ENABLE_ALWAYS
+
     class ActionConfig:
         pngbytes2id = {}
         
@@ -1345,7 +1309,7 @@ class ActionRegisterer():
         ActionConfig(
             name='funcxref_v2:action',
             menu_name='XREF to/from (interactive)',
-            handler=FunctionXrefAction(),
+            handler=DynamicAction(find_function_xrefs),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1353,7 +1317,7 @@ class ActionRegisterer():
         ActionConfig(
             name="tocurrfrom:action",
             menu_name='Find paths to the current function from...',
-            handler=ToCurrentFromAction(),
+            handler=DynamicAction(find_paths_from_many),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1361,7 +1325,7 @@ class ActionRegisterer():
         ActionConfig(
             name='fromcurrto:action',
             menu_name='Find paths from the current function to...',
-            handler=FromCurrentToAction(),
+            handler=DynamicAction(find_paths_to_many),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1370,21 +1334,25 @@ class ActionRegisterer():
             name='currfunccurrblock:action',
             menu_name='Find paths in the current function to ' \
                                      'the current code block',
-            handler=InCurrentFunctionToCurrentCodeBlockAction(),
+            handler=DynamicAction(find_paths_to_code_block),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
         ),
     ]
+
+    hooks = None
     
-    @staticmethod
-    def init():
-        for action in ActionRegisterer.actions:
+    @classmethod
+    def init(cls):
+        for action in cls.actions:
             action.register()
+        cls.hooks = ActionRegisterer.RegisterPopupMenuHooks(ActionRegisterer.actions)
+        cls.hooks.hook()
             
-    @staticmethod
-    def detach():
-        for action in ActionRegisterer.actions:
+    @classmethod
+    def detach(cls):
+        for action in cls.actions:
             action.detach()
 
 
@@ -1434,10 +1402,3 @@ def PLUGIN_ENTRY():
     return idapathfinder_t()
 
 ActionRegisterer.init()
-
-hooks = [
-    ActionRegisterer.RegisterPopupMenuHooks(ActionRegisterer.actions)
-]
-
-for hook in hooks:
-    hook.hook()
