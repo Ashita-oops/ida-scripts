@@ -5,6 +5,7 @@ import idaapi
 import idautils
 import ida_kernwin
 import bisect
+import ida_graph
 
 from shims import ida_shims
 from collections import deque
@@ -18,6 +19,25 @@ if idaapi.IDA_SDK_VERSION < 750:
 #
 # ---------------------------------------------------------------------
 
+class AlleyCatCommands:
+    '''
+    Modes of AlleyCat.
+    '''
+    FIND_PATH_FROM_MANY = 1
+    FIND_PATH_TO_MANY = 2
+    FIND_PATH_TO_CODE_BLOCK = 3
+    FIND_FUNCTION_XREFS = 4
+    
+    @classmethod
+    def is_xref_mode(cls, cmd_id):
+        return cmd_id == cls.FIND_FUNCTION_XREFS
+    
+    @classmethod
+    def is_startend_mode(cls, cmd_id):
+        return (cmd_id == cls.FIND_PATH_FROM_MANY or 
+                cmd_id == cls.FIND_PATH_TO_MANY or 
+                cmd_id == cls.FIND_PATH_TO_CODE_BLOCK)
+        
 class AlleyCatUtils(object):
     @staticmethod
     def get_ea_by_name(name):
@@ -135,15 +155,6 @@ def add_to_namespace(namespace, source, name, variable):
 
 ALLEYCAT_MEMLIMIT = 10000
 
-class AlleyCatMode:
-    '''
-    Modes of AlleyCat.
-        Start-End: Search path from start to end.
-        XREF-mode: Aimlessly search paths from a node to its surroundings.
-    '''
-    STARTEND = 1
-    XREF     = 2
-
 class AlleyCatException(Exception):
     pass
 
@@ -207,9 +218,6 @@ class AlleyCatBase(object):
     def _get_code_block(self, ea):
         return idaapi.get_func(ea)
     
-    @staticmethod
-    def get_mode():
-        return -1
     
     def get_npaths(self):
         return -1
@@ -337,10 +345,6 @@ class AlleyCatSE(AlleyCatBase):
 
         print(disp)
 
-    @staticmethod
-    def get_mode():
-        return AlleyCatMode.STARTEND
-
 class AlleyCatFunctionPaths(AlleyCatSE):
     def __init__(self, start_ea, end_ea, quiet=False):
         try:
@@ -441,7 +445,7 @@ class AlleyCatXR(AlleyCatBase):
     def _build_paths(self):
         start_node = AlleyCatPathNode(ea=self.start, is_target=True)
         self.nodes[self.start] = start_node
-        self._set_root(start_node)
+        self._set_root(start_node) 
         self._build_directional_path(fwd=False)
         self._build_directional_path(fwd=True)
 
@@ -495,11 +499,6 @@ class AlleyCatXR(AlleyCatBase):
                 if child_ea not in bfs_visited_nodes:
                     bfs_queue.append((child_node, depth+1))
 
-    @staticmethod
-    def get_mode():
-        return AlleyCatMode.XREF
-
-
 class AlleyCatFunctionXrefs(AlleyCatXR):
     def __init__(self, start_ea, xref_to_depth, xref_from_depth, quiet=False):
         try:
@@ -515,6 +514,14 @@ class AlleyCatFunctionXrefs(AlleyCatXR):
 # 
 # ---------------------------------------------------------------------
 class AlleyCatColor:
+    # Internal mapping of IDA colors.
+    # Don't know why it's like this :'3
+    BIN_ASM_GRAPH_COLOR_MAP = {
+        0x8113e243: 0x00cb4300,
+        0x8113e244: 0x00009100,
+        0x8113e245: 0x000000bc,
+    }
+    
     GRAPH_EDGE_NODE = 0xff007b
     GRAPH_START_NODE = 0x483882
     GRAPH_END_NODE = 0x483882
@@ -619,9 +626,11 @@ class AlleyCatGraphicNode(object):
             self.color = AlleyCatColor.GRAPH_EDGE_NODE
 
         self.edges = set()
+        self.edges_colors = {}
 
-    def add_connection(self, child_node_id):
+    def add_connection(self, child_node_id, color=idc.DEFCOLOR):
         self.edges.add(child_node_id)
+        self.edges_colors[child_node_id] = color
 
 class AlleyCatGraph(idaapi.GraphViewer):
     '''
@@ -630,17 +639,22 @@ class AlleyCatGraph(idaapi.GraphViewer):
     def __init__(self, results, title="AlleyCat Graph V2"):
         idaapi.GraphViewer.__init__(self, title)
         
+        # Get surrounding infos so we can cache data
+        # about the viewer later if needed.
+        self.associated_viewer = idaapi.get_current_viewer()
+        self.is_same_func = None
+            
         # Important variables deciding how
         # to update graph contents smoothly.
         self.soft_refresh = False
         self.force_refresh = True
-        self.results = results
+        self.update_results(results)
         self.last_results_timestamps = [root_node.timestamp for root_node in results]
         
-        # Colorize node cache
-        # Format data for block_ea is { start_block_ea : end_block_ea }
-        self.colorize_cache_func_eas = (None, None)
-        self.colorize_cache_block_eas = [] 
+        # Node caches.
+        self.cache_func_eas = (None, None)
+        self.cache_block_eas = []
+        self.cache_block_ea2viewerid = {}
 
         # Info caches.
         self.ea2id: dict[int,int] = {}
@@ -679,6 +693,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.cmd_toggle_highlight = None
         self.cmd_toggle_focus_on_click = None
         
+        
     def add_command(self, title, shortcut):
         cmd_id = self.AddCommand(title, shortcut)
         return cmd_id
@@ -702,6 +717,9 @@ class AlleyCatGraph(idaapi.GraphViewer):
             "Toggle highlight/un-highlight all paths", "H")
         self.cmd_toggle_focus_on_click = self.add_command(
             "Toggle focus to address on click", "")
+        
+        if self.is_same_func:
+            self._colorize_all_edges()
 
         return True
         
@@ -713,6 +731,64 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.Clear()
         self.toggle_highlight_all(highlight=False)
         
+    def _cache_block_eas(self, func):
+        if not func:
+            return
+        
+        func_start_ea = ida_shims.start_ea(func) 
+        func_end_ea = ida_shims.end_ea(func) 
+        
+        self.cache_block_eas = []
+        self.cache_func_eas = (func_start_ea, func_end_ea)
+        self.cache_block_ea2viewerid = {}
+            
+        for block in idaapi.FlowChart(func):
+            block_start_ea = ida_shims.start_ea(block)
+            block_end_ea = ida_shims.end_ea(block)
+            self.cache_block_ea2viewerid[block_start_ea] = block.id 
+            self.cache_block_eas.append((block_start_ea, block_end_ea))
+            self.cache_block_eas.sort()
+            
+    def _get_block_eas(self, ea):
+        func_start_ea, func_end_ea = self.cache_func_eas
+        
+        if func_start_ea == None or not (func_start_ea <= ea < func_end_ea):
+            func = idaapi.get_func(ea)
+            if not func:
+                return None, None
+        
+            func_start_ea = ida_shims.start_ea(func)
+            if func_start_ea == idc.BADADDR:
+                return None, None
+            
+            # Don't cache on first block. This will dampen
+            # the performance during computing function 
+            # relationships.
+            if func_start_ea == ea:
+                for block in idaapi.FlowChart(func):
+                    block_start_ea = ida_shims.start_ea(block)
+                    block_end_ea = ida_shims.end_ea(block)
+                    return block_start_ea, block_end_ea
+            
+            # Only start caching when we're trying to
+            # look at second block. Useful as
+            # we only highlight first block when
+            # inspecting function relationships.
+            self._cache_block_eas(func)
+        
+        if not self.cache_block_eas:
+            return None, None
+        
+        # Search complexity on average: O(logN)
+        pi = bisect.bisect_left(self.cache_block_eas, ea, 
+                                key=lambda block_eas:block_eas[0])
+        
+        block_start_ea, block_end_ea = self.cache_block_eas[pi]
+        if not block_start_ea <= ea < block_end_ea:
+            return None, None
+        
+        return block_start_ea, block_end_ea
+        
     def add_node(self, node:'AlleyCatPathNode') -> int:
         gnode = AlleyCatGraphicNode(node)
         
@@ -723,8 +799,37 @@ class AlleyCatGraph(idaapi.GraphViewer):
         return node_id
     
     def add_edge(self, src_node_id, dest_node_id):
-        self.id2gnodes[src_node_id].add_connection(dest_node_id)
-        return super().AddEdge(src_node_id, dest_node_id)
+        super().AddEdge(src_node_id, dest_node_id)
+        
+        if not self.is_same_func:
+            self.id2gnodes[src_node_id].add_connection(dest_node_id)
+            return
+        
+        graph_viewer = ida_graph.get_viewer_graph(self.associated_viewer)
+        if not graph_viewer:
+            return
+        
+        # Get edge color in the associated viewer.    
+        src_node_ea = self.id2gnodes[src_node_id].ea
+        dst_node_ea = self.id2gnodes[dest_node_id].ea
+        
+        src_block_ea, _ = self._get_block_eas(src_node_ea)
+        dst_block_ea, _ = self._get_block_eas(dst_node_ea)
+        if (src_block_ea not in self.cache_block_ea2viewerid or
+            dst_block_ea not in self.cache_block_ea2viewerid):
+            return                
+        
+        src_block_viewerid = self.cache_block_ea2viewerid[src_block_ea]
+        dst_block_viewerid = self.cache_block_ea2viewerid[dst_block_ea]
+        
+        edge = ida_graph.edge_t(src_block_viewerid, dst_block_viewerid)
+        edge_info = graph_viewer.get_edge(edge)
+        if not edge_info:
+            self.id2gnodes[src_node_id].add_connection(dest_node_id)
+            return
+        
+        color = AlleyCatColor.BIN_ASM_GRAPH_COLOR_MAP[edge_info.color]
+        self.id2gnodes[src_node_id].add_connection(dest_node_id, color)
         
     def update_results(self, results):
         self.results = results
@@ -765,7 +870,46 @@ class AlleyCatGraph(idaapi.GraphViewer):
 
                 if child_node.ea not in bfs_visited:
                     bfs_queue.append(child_node)
+                    
+    def _setup_if_same_func(self):
+        # NOTE: What the hell, too lazy...
+        if len(self.results) != 1:
+            return False
         
+        # NOTE: Lazy part 2...
+        root_node = self.results[0]
+        if root_node.xrefs_to:
+            return False
+        
+        func = idaapi.get_func(root_node.ea)
+        if not func: 
+            return False
+        
+        func_start_ea = ida_shims.start_ea(func)
+        func_end_ea = ida_shims.end_ea(func)
+        if func_start_ea == idc.BADADDR or func_end_ea == idc.BADADDR:
+            return False
+                        
+        bfs_queue = deque()
+        bfs_queue.append(root_node)
+        bfs_visited = set()
+        
+        while bfs_queue:
+            curr_node = bfs_queue.popleft()
+            if curr_node.ea in bfs_visited:
+                continue
+            if not func_start_ea <= curr_node.ea < func_end_ea:
+                return False
+            
+            bfs_visited.add(curr_node.ea)
+
+            for child_node in curr_node.xrefs_from:
+                if child_node.ea not in bfs_visited:
+                    bfs_queue.append(child_node)
+        
+        self._cache_block_eas(func)
+        return True
+                    
     def _do_hard_refresh(self):
         # Clear the graph before refreshing
         self.clear()
@@ -780,17 +924,17 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # TODO: implement excludes & includes
         # includes = self.history.get_includes()
         # excludes = self.history.get_excludes()
+        
+        self.is_same_func = self._setup_if_same_func()
 
         for root_node in self.results:
             if root_node.ea not in self.ea2id:
                 self.add_node(root_node)
-
             if root_node.xrefs_to:
                 self._do_directional_refresh(root_node, fwd=False)
-
             if root_node.xrefs_from:
                 self._do_directional_refresh(root_node, fwd=True)
-
+                
         return True
     
     def _do_soft_refresh(self):
@@ -811,6 +955,17 @@ class AlleyCatGraph(idaapi.GraphViewer):
         
         return True
 
+    def Refresh(self):
+        result = super().Refresh()
+        
+        # Always need to recolor the edges :(
+        # The edge color goes away after EVERY
+        # Refresh()es...
+        if self.is_same_func:
+            self._colorize_all_edges()
+            
+        return result
+
     def OnRefresh(self):
         curr_results_timestamps = list(root_node.timestamp for root_node in self.results)
                 
@@ -827,7 +982,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
         if self.soft_refresh:
             self.soft_refresh = False
             return self._do_soft_refresh()
-
+            
         return True
     
     def OnGetText(self, node_id):
@@ -889,13 +1044,14 @@ class AlleyCatGraph(idaapi.GraphViewer):
             self.history.reset()
             self.soft_refresh = True
             self.Refresh()
+            self._colorize_all_edges()
 
         elif self.cmd_toggle_highlight == cmd_id:
             self.is_highlighting_path = not self.is_highlighting_path
             self.toggle_highlight_all(highlight=self.is_highlighting_path)
             
         return 0
-            
+
     def _focus_on_node(self, node_id):
         if node_id in self.id2gnodes:
             node_ea = self.id2gnodes[node_id].ea
@@ -965,8 +1121,32 @@ class AlleyCatGraph(idaapi.GraphViewer):
         return ((xref.type != idc.fl_F) and
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
         
+    def _colorize_edge(self, src_node_id, dst_node_id, color):
+        widget = self.GetWidget()
+        viewer = None
+        if widget:
+            viewer = ida_graph.get_viewer_graph(widget)
+        if not viewer:
+            return
+        
+        edge = ida_graph.edge_t()
+        edge.src = src_node_id
+        edge.dst = dst_node_id
+        
+        edge_info = viewer.get_edge(edge)
+        if not edge_info:
+            return
+        edge_info.color = color
+        
+    def _colorize_all_edges(self):
+        for node_id in self.id2gnodes:
+            edges_colors = self.id2gnodes[node_id].edges_colors
+            for child_node_id in edges_colors:
+                color = edges_colors[child_node_id] 
+                self._colorize_edge(node_id, child_node_id, color)
+        
     def _colorize_ea_range(self, start_ea, end_ea, color):
-        if not start_ea < end_ea:
+        if not start_ea or start_ea >= end_ea:
             return 
         
         ea = start_ea
@@ -975,54 +1155,8 @@ class AlleyCatGraph(idaapi.GraphViewer):
             ea = ida_shims.next_head(ea)
 
     def colorize_node(self, ea, color):
-        func_start_ea, func_end_ea = self.colorize_cache_func_eas
-        
-        if func_start_ea == None or not (func_start_ea <= ea < func_end_ea):
-            func = idaapi.get_func(ea)
-            if not func:
-                return
-            
-            func_start_ea = ida_shims.start_ea(func)
-            func_end_ea = ida_shims.end_ea(func)
-            
-            # Don't cache on first block. This will dampen
-            # the performance during computing function 
-            # relationships.
-            if func_start_ea == ea:
-                for block in idaapi.FlowChart(func):
-                    block_start_ea = ida_shims.start_ea(block)
-                    block_end_ea = ida_shims.end_ea(block)
-                    self._colorize_ea_range(block_start_ea, block_end_ea, color)
-                    return
-            
-            # Only start caching when we're trying to
-            # look at second block. Useful as
-            # we only highlight first block when
-            # inspecting function relationships.
-            self.colorize_cache_block_eas = []
-            self.colorize_cache_func_eas = (func_start_ea, func_end_ea)
-            
-            for block in idaapi.FlowChart(func):
-                block_start_ea = ida_shims.start_ea(block)
-                block_end_ea = ida_shims.end_ea(block)
-                self.colorize_cache_block_eas.append((block_start_ea, block_end_ea))
-                self.colorize_cache_block_eas.sort()
-        
-        # Search for block took O(logN)
-        pi = bisect.bisect_left(self.colorize_cache_block_eas, ea, 
-                                key=lambda block_eas:block_eas[0])
-        
-        # Incase self.colorize_cache_block_eas
-        if len(self.colorize_cache_block_eas) == 0:
-            return
-        
-        # Sanity checks. Who knows.
-        block_start_ea, block_end_ea = self.colorize_cache_block_eas[pi]
-        if not block_start_ea <= ea < block_end_ea:
-            return
-        
+        block_start_ea, block_end_ea = self._get_block_eas(ea)
         self._colorize_ea_range(block_start_ea, block_end_ea, color)
-        
 
     def highlight(self, ea):
         # Highlights an entire code block
@@ -1129,23 +1263,21 @@ class AlleyCatPaths(object):
     def _find_and_plot_paths(self, sources, targets=None, 
                              xref_to_depth=None, 
                              xref_from_depth=None, 
-                             klass=AlleyCatFunctionPaths):
+                             klass=AlleyCatFunctionPaths,
+                             cmd_id=None):
         
-        klass_mode = klass.get_mode()
-
         results = []
-        if AlleyCatMode.XREF == klass_mode:
+        if AlleyCatCommands.is_xref_mode(cmd_id):
             results = self._get_xref_results(
                                 sources, xref_to_depth, xref_from_depth, klass
                             )
-        if AlleyCatMode.STARTEND == klass_mode:
+        if AlleyCatCommands.is_startend_mode(cmd_id):
             results = self._get_startend_results(
                                 sources, targets, klass
                             )
-
         if not results:
             return
-
+        
         # Close any previous graph so that it unhighlights
         # previous paths :)
         graph = self.__class__.graph
@@ -1236,22 +1368,28 @@ class AlleyCatPaths(object):
         target = ida_shims.get_screen_ea()
         source = self._current_function()
         if source:
-            self._find_and_plot_paths(
-                [source], targets=[target], klass=AlleyCatCodePaths)
+            self._find_and_plot_paths([source], 
+                                      targets=[target], 
+                                      klass=AlleyCatCodePaths, 
+                                      cmd_id=AlleyCatCommands.FIND_PATH_TO_CODE_BLOCK)
 
     def FindPathsToMany(self):
         source = self._current_function()
         if source:
             targets = self._get_user_selected_functions(many=True)
             if targets:
-                self._find_and_plot_paths([source], targets=targets)
+                self._find_and_plot_paths([source], 
+                                          targets=targets, 
+                                          cmd_id=AlleyCatCommands.FIND_PATH_TO_MANY)
 
     def FindPathsFromMany(self):
         target = self._current_function()
         if target:
             sources = self._get_user_selected_functions(many=True)
             if sources:
-                self._find_and_plot_paths(sources, targets=[target])
+                self._find_and_plot_paths(sources, 
+                                          targets=[target],
+                                          cmd_id=AlleyCatCommands.FIND_PATH_FROM_MANY)
 
     def FindFunctionXrefs(self):
         source = self._current_function()
@@ -1261,30 +1399,17 @@ class AlleyCatPaths(object):
             return
         
         if source:
-            self._find_and_plot_paths(
-                [source], 
-                xref_to_depth=xref_to_depth,
-                xref_from_depth=xref_from_depth,
-                klass=AlleyCatFunctionXrefs
-            )
+            self._find_and_plot_paths([source], 
+                                      xref_to_depth=xref_to_depth,
+                                      xref_from_depth=xref_from_depth,
+                                      klass=AlleyCatFunctionXrefs,
+                                      cmd_id=AlleyCatCommands.FIND_FUNCTION_XREFS)
 
 # --------------------------------------------------------------------
 #
 # Helper functions to execute commands selected from dropdown menus.
 #
 # --------------------------------------------------------------------
-def find_paths_from_many():
-    AlleyCatPaths().FindPathsFromMany()
-
-def find_paths_to_many():
-    AlleyCatPaths().FindPathsToMany()
-
-def find_paths_to_code_block():
-    AlleyCatPaths().FindPathsToCodeBlock()
-    
-def find_function_xrefs():
-    AlleyCatPaths().FindFunctionXrefs()
-
 
 class ActionRegisterer():
     class DynamicAction(idaapi.action_handler_t):
@@ -1370,7 +1495,7 @@ class ActionRegisterer():
         ActionConfig(
             name='funcxref_v2:action',
             menu_name='XREF to/from (interactive)',
-            handler=DynamicAction(find_function_xrefs),
+            handler=DynamicAction(lambda: AlleyCatPaths().FindFunctionXrefs()),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1378,7 +1503,7 @@ class ActionRegisterer():
         ActionConfig(
             name="tocurrfrom:action",
             menu_name='Find paths to the current function from...',
-            handler=DynamicAction(find_paths_from_many),
+            handler=DynamicAction(lambda: AlleyCatPaths().FindPathsFromMany()),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1386,7 +1511,7 @@ class ActionRegisterer():
         ActionConfig(
             name='fromcurrto:action',
             menu_name='Find paths from the current function to...',
-            handler=DynamicAction(find_paths_to_many),
+            handler=DynamicAction(lambda: AlleyCatPaths().FindPathsToMany()),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
@@ -1395,7 +1520,7 @@ class ActionRegisterer():
             name='currfunccurrblock:action',
             menu_name='Find paths in the current function to ' \
                                      'the current code block',
-            handler=DynamicAction(find_paths_to_code_block),
+            handler=DynamicAction(lambda: AlleyCatPaths().FindPathsToCodeBlock()),
             icon=199,
             path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
