@@ -441,7 +441,7 @@ class AlleyCatXR(AlleyCatBase):
     def _build_paths(self):
         start_node = AlleyCatPathNode(ea=self.start, is_target=True)
         self.nodes[self.start] = start_node
-        self._set_root(start_node)
+        self._set_root(start_node) 
         self._build_directional_path(fwd=False)
         self._build_directional_path(fwd=True)
 
@@ -515,6 +515,14 @@ class AlleyCatFunctionXrefs(AlleyCatXR):
 # 
 # ---------------------------------------------------------------------
 class AlleyCatColor:
+    # Internal mapping of IDA colors.
+    # Don't know why it's like this :'3
+    BIN_ASM_GRAPH_COLOR_MAP = {
+        0x8113e243: 0x00ff0000,
+        0x8113e244: 0x0000ff00,
+        0x8113e245: 0x000000ff,
+    }
+    
     GRAPH_EDGE_NODE = 0xff007b
     GRAPH_START_NODE = 0x483882
     GRAPH_END_NODE = 0x483882
@@ -634,13 +642,13 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # to update graph contents smoothly.
         self.soft_refresh = False
         self.force_refresh = True
-        self.results = results
+        self.update_results(results)
         self.last_results_timestamps = [root_node.timestamp for root_node in results]
         
-        # Colorize node cache
-        # Format data for block_ea is { start_block_ea : end_block_ea }
-        self.colorize_cache_func_eas = (None, None)
-        self.colorize_cache_block_eas = [] 
+        # Node caches.
+        self.cache_func_eas = (None, None)
+        self.cache_block_eas = []
+        self.cache_block_ea2viewerid = {}
 
         # Info caches.
         self.ea2id: dict[int,int] = {}
@@ -713,6 +721,64 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.Clear()
         self.toggle_highlight_all(highlight=False)
         
+    def _cache_block_eas(self, func):
+        if not func:
+            return
+        
+        func_start_ea = ida_shims.start_ea(func) 
+        func_end_ea = ida_shims.end_ea(func) 
+        
+        self.cache_block_eas = []
+        self.cache_func_eas = (func_start_ea, func_end_ea)
+        self.cache_block_ea2viewerid = {}
+            
+        for block in idaapi.FlowChart(func):
+            block_start_ea = ida_shims.start_ea(block)
+            block_end_ea = ida_shims.end_ea(block)
+            self.cache_block_ea2viewerid[block_start_ea] = block.id 
+            self.cache_block_eas.append((block_start_ea, block_end_ea))
+            self.cache_block_eas.sort()
+    
+    def _get_block_eas(self, ea):
+        func_start_ea, func_end_ea = self.cache_func_eas
+        
+        if func_start_ea == None or not (func_start_ea <= ea < func_end_ea):
+            func = idaapi.get_func(ea)
+            if not func:
+                return None, None
+        
+            func_start_ea = ida_shims.start_ea(func)
+            if func_start_ea == idc.BADADDR:
+                return None, None
+            
+            # Don't cache on first block. This will dampen
+            # the performance during computing function 
+            # relationships.
+            if func_start_ea == ea:
+                for block in idaapi.FlowChart(func):
+                    block_start_ea = ida_shims.start_ea(block)
+                    block_end_ea = ida_shims.end_ea(block)
+                    return block_start_ea, block_end_ea
+            
+            # Only start caching when we're trying to
+            # look at second block. Useful as
+            # we only highlight first block when
+            # inspecting function relationships.
+            self._cache_block_eas(func)
+        
+        if not self.cache_block_eas:
+            return None, None
+        
+        # Search complexity on average: O(logN)
+        pi = bisect.bisect_left(self.cache_block_eas, ea, 
+                                key=lambda block_eas:block_eas[0])
+        
+        block_start_ea, block_end_ea = self.cache_block_eas[pi]
+        if not block_start_ea <= ea < block_end_ea:
+            return None, None
+        
+        return block_start_ea, block_end_ea
+        
     def add_node(self, node:'AlleyCatPathNode') -> int:
         gnode = AlleyCatGraphicNode(node)
         
@@ -765,7 +831,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
 
                 if child_node.ea not in bfs_visited:
                     bfs_queue.append(child_node)
-        
+                    
     def _do_hard_refresh(self):
         # Clear the graph before refreshing
         self.clear()
@@ -784,13 +850,11 @@ class AlleyCatGraph(idaapi.GraphViewer):
         for root_node in self.results:
             if root_node.ea not in self.ea2id:
                 self.add_node(root_node)
-
             if root_node.xrefs_to:
                 self._do_directional_refresh(root_node, fwd=False)
-
             if root_node.xrefs_from:
                 self._do_directional_refresh(root_node, fwd=True)
-
+                
         return True
     
     def _do_soft_refresh(self):
@@ -966,7 +1030,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
                 (ida_shims.get_func_attr(xref.frm, idc.FUNCATTR_START) == source))
         
     def _colorize_ea_range(self, start_ea, end_ea, color):
-        if not start_ea < end_ea:
+        if not start_ea or start_ea >= end_ea:
             return 
         
         ea = start_ea
@@ -975,54 +1039,8 @@ class AlleyCatGraph(idaapi.GraphViewer):
             ea = ida_shims.next_head(ea)
 
     def colorize_node(self, ea, color):
-        func_start_ea, func_end_ea = self.colorize_cache_func_eas
-        
-        if func_start_ea == None or not (func_start_ea <= ea < func_end_ea):
-            func = idaapi.get_func(ea)
-            if not func:
-                return
-            
-            func_start_ea = ida_shims.start_ea(func)
-            func_end_ea = ida_shims.end_ea(func)
-            
-            # Don't cache on first block. This will dampen
-            # the performance during computing function 
-            # relationships.
-            if func_start_ea == ea:
-                for block in idaapi.FlowChart(func):
-                    block_start_ea = ida_shims.start_ea(block)
-                    block_end_ea = ida_shims.end_ea(block)
-                    self._colorize_ea_range(block_start_ea, block_end_ea, color)
-                    return
-            
-            # Only start caching when we're trying to
-            # look at second block. Useful as
-            # we only highlight first block when
-            # inspecting function relationships.
-            self.colorize_cache_block_eas = []
-            self.colorize_cache_func_eas = (func_start_ea, func_end_ea)
-            
-            for block in idaapi.FlowChart(func):
-                block_start_ea = ida_shims.start_ea(block)
-                block_end_ea = ida_shims.end_ea(block)
-                self.colorize_cache_block_eas.append((block_start_ea, block_end_ea))
-                self.colorize_cache_block_eas.sort()
-        
-        # Search for block took O(logN)
-        pi = bisect.bisect_left(self.colorize_cache_block_eas, ea, 
-                                key=lambda block_eas:block_eas[0])
-        
-        # Incase self.colorize_cache_block_eas
-        if len(self.colorize_cache_block_eas) == 0:
-            return
-        
-        # Sanity checks. Who knows.
-        block_start_ea, block_end_ea = self.colorize_cache_block_eas[pi]
-        if not block_start_ea <= ea < block_end_ea:
-            return
-        
+        block_start_ea, block_end_ea = self._get_block_eas(ea)
         self._colorize_ea_range(block_start_ea, block_end_ea, color)
-        
 
     def highlight(self, ea):
         # Highlights an entire code block
