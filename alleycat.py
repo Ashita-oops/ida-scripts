@@ -1149,7 +1149,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
         
     def _colorize_ea_range(self, start_ea, end_ea, color):
         if not start_ea or start_ea >= end_ea:
-            ida_shims.ask_yn(0, "Colorize ea range failure!\n"
+            ida_kernwin.warning(0, "Colorize ea range failure!\n"
                                 "   - start_ea = 0x%x\n"
                                 "   - end_ea = 0x%x\n" % (start_ea, end_ea))
             return 
@@ -1288,6 +1288,7 @@ class AlleyCatPaths(object):
         graph = self.__class__.graph
         if graph != None:
             s = time.time()
+            graph.clear()
             graph.update_results(results)
             graph.update_associated_viewer()
             graph.Refresh()
