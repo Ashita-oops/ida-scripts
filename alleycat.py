@@ -641,14 +641,14 @@ class AlleyCatGraph(idaapi.GraphViewer):
         
         # Get surrounding infos so we can cache data
         # about the viewer later if needed.
-        self.associated_viewer = idaapi.get_current_viewer()
+        self.update_associated_viewer()
         self.is_same_func = None
             
         # Important variables deciding how
         # to update graph contents smoothly.
         self.soft_refresh = False
         self.force_refresh = True
-        self.update_results(results)
+        self.results = results
         self.last_results_timestamps = [root_node.timestamp for root_node in results]
         
         # Node caches.
@@ -711,13 +711,13 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # self.cmd_redo = self.AddCommand("Redo", "")
         # self.cmd_exclude = self.AddCommand("Exclude node", "")
         # self.cmd_include = self.AddCommand("Include node", "")
-        
         self.cmd_refresh = self.add_command("Refresh graph", "R")
         self.cmd_toggle_highlight = self.add_command(
             "Toggle highlight/un-highlight all paths", "H")
         self.cmd_toggle_focus_on_click = self.add_command(
             "Toggle focus to address on click", "")
         
+        # Colorize edges is always a mind game...        
         if self.is_same_func:
             self._colorize_all_edges()
 
@@ -828,12 +828,15 @@ class AlleyCatGraph(idaapi.GraphViewer):
             self.id2gnodes[src_node_id].add_connection(dest_node_id)
             return
         
-        color = AlleyCatColor.BIN_ASM_GRAPH_COLOR_MAP[edge_info.color]
+        color = AlleyCatColor.BIN_ASM_GRAPH_COLOR_MAP.get(edge_info.color, idc.DEFCOLOR)
         self.id2gnodes[src_node_id].add_connection(dest_node_id, color)
         
     def update_results(self, results):
         self.results = results
         self.force_refresh = True
+        
+    def update_associated_viewer(self):
+        self.associated_viewer = idaapi.get_current_viewer()
 
     def _do_directional_refresh(self, root_node, fwd=True):
         bfs_queue = deque()
@@ -954,7 +957,7 @@ class AlleyCatGraph(idaapi.GraphViewer):
                 self.id2gnodes[node_id].text = updated_node_label
         
         return True
-
+    
     def Refresh(self):
         result = super().Refresh()
         
@@ -1044,14 +1047,13 @@ class AlleyCatGraph(idaapi.GraphViewer):
             self.history.reset()
             self.soft_refresh = True
             self.Refresh()
-            self._colorize_all_edges()
 
         elif self.cmd_toggle_highlight == cmd_id:
             self.is_highlighting_path = not self.is_highlighting_path
             self.toggle_highlight_all(highlight=self.is_highlighting_path)
             
         return 0
-
+    
     def _focus_on_node(self, node_id):
         if node_id in self.id2gnodes:
             node_ea = self.id2gnodes[node_id].ea
@@ -1147,6 +1149,9 @@ class AlleyCatGraph(idaapi.GraphViewer):
         
     def _colorize_ea_range(self, start_ea, end_ea, color):
         if not start_ea or start_ea >= end_ea:
+            ida_shims.ask_yn(0, "Colorize ea range failure!\n"
+                                "   - start_ea = 0x%x\n"
+                                "   - end_ea = 0x%x\n" % (start_ea, end_ea))
             return 
         
         ea = start_ea
@@ -1283,8 +1288,8 @@ class AlleyCatPaths(object):
         graph = self.__class__.graph
         if graph != None:
             s = time.time()
-            graph.clear()
             graph.update_results(results)
+            graph.update_associated_viewer()
             graph.Refresh()
             graph.Show()
             e = time.time()
@@ -1522,7 +1527,6 @@ class ActionRegisterer():
                                      'the current code block',
             handler=DynamicAction(lambda: AlleyCatPaths().FindPathsToCodeBlock()),
             icon=199,
-            path_to_in_menu="View/Graphs/",
             in_popup_widget_type=ida_kernwin.BWN_DISASM,
         ),
     ]
