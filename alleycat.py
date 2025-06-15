@@ -693,11 +693,6 @@ class AlleyCatGraph(idaapi.GraphViewer):
         self.cmd_toggle_highlight = None
         self.cmd_toggle_focus_on_click = None
         
-        
-    def add_command(self, title, shortcut):
-        cmd_id = self.AddCommand(title, shortcut)
-        return cmd_id
-
     def Show(self):
         '''
         Display the graph.
@@ -711,10 +706,13 @@ class AlleyCatGraph(idaapi.GraphViewer):
         # self.cmd_redo = self.AddCommand("Redo", "")
         # self.cmd_exclude = self.AddCommand("Exclude node", "")
         # self.cmd_include = self.AddCommand("Include node", "")
-        self.cmd_refresh = self.add_command("Refresh graph", "R")
-        self.cmd_toggle_highlight = self.add_command(
-            "Toggle highlight/un-highlight all paths", "H")
-        self.cmd_toggle_focus_on_click = self.add_command(
+        self.cmd_refresh = self.AddCommand(
+            "Refresh graph", "")
+        self.cmd_goto = self.AddCommand(
+            "Search node", "")
+        self.cmd_toggle_highlight = self.AddCommand(
+            "Toggle highlight/un-highlight all paths", "")
+        self.cmd_toggle_focus_on_click = self.AddCommand(
             "Toggle focus to address on click", "")
         
         # Colorize edges is always a mind game...        
@@ -1019,7 +1017,26 @@ class AlleyCatGraph(idaapi.GraphViewer):
                                '↓'.center(displen), 
                                self[dst].center(displen))
         
-    def OnCommand(self, cmd_id):        
+    def select_node_by_ea(self, ea):
+        eas = []
+        for node_id in self.id2gnodes:
+            eas.append((self.id2gnodes[node_id].ea, node_id))
+        eas.sort(key=lambda x:x[0])
+        
+        for i in range(len(eas)-1):
+            if eas[i][0] <= ea < eas[i+1][0]:
+                self.Select(eas[i][1])
+                return True
+            
+        return False
+    
+    def select_node_by_label(self, label):
+        for node_id in self.id2gnodes:
+            if label in self.id2gnodes[node_id].text:
+                self.Select(node_id)
+                return
+        
+    def do_cmd(self, cmd_id):
         # if self.cmd_undo == cmd_id:
         #     if self.include_on_click or self.exclude_on_click:
         #         self.include_on_click = False
@@ -1052,6 +1069,20 @@ class AlleyCatGraph(idaapi.GraphViewer):
             self.is_highlighting_path = not self.is_highlighting_path
             self.toggle_highlight_all(highlight=self.is_highlighting_path)
             
+        elif self.cmd_goto == cmd_id:
+            user_input = ida_kernwin.ask_str("", 1, "Please enter a label/address:")
+            if user_input == "":
+                return
+            
+            if all(c in "0123456789abcdef" for c in user_input):
+                ea = int(user_input, 16)
+                if self.select_node_by_ea(ea):
+                    return 
+            
+            self.select_node_by_label(user_input)
+        
+    def OnCommand(self, cmd_id):        
+        self.do_cmd(cmd_id)
         return 0
     
     def _focus_on_node(self, node_id):
