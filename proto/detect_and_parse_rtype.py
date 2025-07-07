@@ -6,13 +6,18 @@ import subprocess
 import json
 import os
 
-GO_PARSE_EXE = "C:\\Users\\null\\Documents\\go_ast\\main.exe"
+from collections import namedtuple
 
-class GoConvertFailed(Exception):
+class GoConvertFailedError(Exception):
     pass
 
+# =========================================================================
+#       Golang AST generator
+# =========================================================================
+
+GO_PARSE_EXE = "C:\\Users\\null\\Documents\\go_ast\\main.exe"
+
 def interact_with_process(command, input_data):
-    # Open a process with pipes for stdin, stdout, and stderr
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -25,30 +30,109 @@ def interact_with_process(command, input_data):
     stdout, stderr = None, None
 
     try:
-        stdout, stderr = process.communicate(input=input_data+"\n", timeout=10)
+        stdout, stderr = process.communicate(input=input_data, timeout=10)
     except subprocess.TimeoutExpired:
         process.kill()
-        raise GoConvertFailed(f"Go AST parser {GO_PARSE_EXE} timed out after 10 seconds")
+        raise GoConvertFailedError(f"Go AST parser {GO_PARSE_EXE} timed out after 10 seconds")
         
     if process.returncode != 0:
-        raise GoConvertFailed(f"Go AST parser {GO_PARSE_EXE} returned with code {process.returncode}")
+        raise GoConvertFailedError(f"Go AST parser {GO_PARSE_EXE} returned with code {process.returncode}")
 
     return stdout, stderr
     
 def get_go_ast(go_src):
     if not os.path.exists(GO_PARSE_EXE):
-        raise GoConvertFailed(f"Go AST parser \"{GO_PARSE_EXE}\" not found")
+        raise GoConvertFailedError(f"Go AST parser \"{GO_PARSE_EXE}\" not found")
     
     stdout, stderr = interact_with_process(
                         GO_PARSE_EXE, json.dumps({
                             "go_source": go_src 
-                        }))
+                        }) + "\n")
 
-    return json.loads(stdout)
+    result = json.loads(stdout)
+    if result["status"] != 0:
+        raise GoConvertFailedError(result["error"])
+    return result["result"]
 
 def get_typedef_ast(typedef):
-    return get_go_ast("package main\n"
-                      f"type X {typedef}") # yeah, trick :(
+    result = get_go_ast("package main\n"
+                        f"type X {typedef}") # yeah, trick :(
+    try:
+        return result["Decls"][0]["Specs"][0]["Type"]     # shortcut :)
+    except Exception as e:
+        raise GoConvertFailedError("get_typedef_ast unhandled error: " + e.str())
+    
+# =========================================================================
+#       Golang parser
+# =========================================================================
+
+def get_type_info(typename: str):
+    # TODO: implement here
+    # fuzzy finder is enough?
+    pass
+
+def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name/ etc...
+    if ast_type["NodeType"] != 'StructType':
+        return ""
+    
+    fields = ast_type["Fields"]["List"]
+    if not fields: # struct {}
+        names_and_types = []
+    else:
+    
+    names_and_types = []
+
+    for field in fields:
+        field_type = get_type(field["Type"])
+
+        for i, name in enumerate(field["Names"]):
+            # TODO: if it's SelectorExpr 
+            # -> we need to search for the struct name in the whole database
+            if name["NodeType"] != "Ident": 
+                raise GoConvertFailedError(f"create_struct: unhandled: {field['Names'][i]['NodeType'] = }")
+            
+            names_and_types.append((name["Name"], field_type))
+
+    #  Special case:
+    #      *struct {F uintptr; ...} 
+    #  -> F will be interpreted as a function
+    
+    is_likely_closure = (
+        names_and_types and 
+        names_and_types[0][0] == 'F' and 
+        names_and_types[0][1] == 'uintptr' 
+    )
+
+    return ""
+
+def get_type(ast_type, **ctx):
+    node_type = ast_type["NodeType"]
+
+    if node_type == "StarExpr":
+        return '_ptr_' + get_type(ast_type["X"], **ctx)
+    
+    if node_type == "Ident":
+        return ast_type["Name"]
+
+    if node_type == "SelectorExpr":
+        return ast_type["X"]["Name"] + "_" + ast_type["Sel"]["Name"]
+
+    if node_type == "ChanType":
+        if ast_type["Dir"] == "SEND":
+            return "_chan_left_chan_" + get_type(ast_type["Value"], **ctx)
+        if ast_type["Dir"] == "RECV":
+            return "chan_chan_left__" + get_type(ast_type["Value"], **ctx) # this is me bullshiting...
+        if ast_type["Dir"] == "BOTH":
+            return "chan_" + get_type(ast_type["Value"], **ctx)
+        
+    if node_type == "StructType":
+        return make_new_struct(ast_type, **ctx)
+
+    raise GoConvertFailedError(f"get_simple_type: unhandled {ast_type['NodeType'] = }")
+
+# =========================================================================
+#       IDA C-tree parser
+# =========================================================================
 
 class runtime_newobject_finder(idaapi.ctree_visitor_t):
     def __init__(self, ea):
@@ -154,7 +238,6 @@ def extract_type_runtime_new_object(
     rtype_str = idc.get_bytes(rtype_str_addr + 2, rtype_str_size)
     return rtype_str
 
-
 if __name__ == '__main__':
     ret_item, call_item, arg_item = get_ctree_item(idaapi.get_screen_ea())
 
@@ -163,5 +246,5 @@ if __name__ == '__main__':
         print("what the f")
         exit(-1)
 
-    go_ast = get_typedef_ast(rtype_str.decode())
-    print(json.dumps(go_ast, indent=4))
+    ast_type = get_typedef_ast(rtype_str.decode())
+    get_struct_type(ast_type)
