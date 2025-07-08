@@ -2,11 +2,18 @@ import idaapi
 import idc
 import ida_ida
 import ida_kernwin
+import ida_typeinf
 import subprocess
 import json
 import os
+import re
 
 from collections import namedtuple
+
+if idaapi.IDA_SDK_VERSION < 900:
+    raise ValueError("Sorry. Current version not supported: IDA_SDK_VERSION = %d < 900" % idaapi.IDA_SDK_VERSION)
+if ida_ida.inf_get_procname() != "metapc" and ida_ida.inf_is_64bit():
+    raise ValueError("Sorry. Current method detection only works for x64 binaries: " + ida_ida.inf_get_procname())
 
 class GoConvertFailedError(Exception):
     pass
@@ -51,10 +58,17 @@ def get_go_ast(go_src):
 
     result = json.loads(stdout)
     if result["status"] != 0:
-        raise GoConvertFailedError(result["error"])
+        raise GoConvertFailedError(result["error"] + f"\n   on {go_src}")
     return result["result"]
 
-def get_typedef_ast(typedef):
+def get_typedef_ast(typedef: str):
+    # HACK: Sometimes Go adds `.autotmp_` as the field name variable :(
+    # we need to manually detect it and change it to proper variable name :(
+    if "struct {" in typedef:
+        typedef = typedef.replace(" .autotmp_", " autotmp_")
+    #                              ^             ^
+    #                     NOTE: is the space here enough to detect as field name?
+
     result = get_go_ast("package main\n"
                         f"type X {typedef}") # yeah, trick :(
     try:
@@ -66,10 +80,68 @@ def get_typedef_ast(typedef):
 #       Golang parser
 # =========================================================================
 
-def get_type_info(typename: str):
-    # TODO: implement here
-    # fuzzy finder is enough?
-    pass
+# Following https://tip.golang.org/src/cmd/compile/abi-internal,
+# hope that it's generic enough to add new architecture here...
+RegMapByArch = namedtuple("RegMapByArch", ['args', 'closure_ctx'])
+REG_MAPS: dict[tuple[str, int], RegMapByArch] = {
+    ("metapc", 64): \
+        RegMapByArch(
+            args = ["RAX", "RBX", "RCX", "RDI", "RSI", "R8", "R9", "R10", "R11"],
+            closure_ctx = "RDX"
+        )
+}
+
+def get_procinfo():
+    BITS = None
+    if ida_ida.inf_is_32bit_exactly():
+        BITS = 32
+    elif ida_ida.inf_is_64bit():
+        BITS = 64
+    procname = ida_ida.inf_get_procname()
+    return procname, BITS
+
+def get_arg0_loc():
+    procname, BITS = get_procinfo()
+    if (procname, BITS) not in REG_MAPS:
+        raise GoConvertFailedError(f"get_first_arg_reg: {procname}, {BITS} bits not supported")
+    return REG_MAPS[(procname, BITS)].args[0]
+
+def get_vararg_reg(currloc, size, is_float=False) -> tuple[str, int]:
+    # TODO: implement is_float = True
+    procname, BITS = get_procinfo()
+    if BITS != 64:
+        raise GoConvertFailedError(f"get_vararg_reg: {procname}, {BITS} bits not supported")
+
+    if currloc == None:
+        currloc = (get_arg0_loc(), 0)
+
+    # ^ denotes stack offset :)
+    if currloc.startswith('^'):
+        stkoff = int(currloc[1:])
+        return f'^{stkoff}.{size}', f'^{stkoff+size}'
+
+    reg_args = REG_MAPS[(procname, BITS)].args
+    reg_idx = reg_args.index(currloc)
+
+def idb_type(typename: str):
+    # NOTE: do a fuzzy finder here if 
+    # direct search doesn't yield a result :)
+    tif = ida_typeinf.tinfo_t()
+    if tif.get_named_type(typename):
+        return typename
+    
+    # HACK: For newly created struct, e.g
+    # *struct { ... }, there's no
+    # pointer type with name to it.
+    #
+    # So we return name as '*' + type :)
+    if typename.startswith('_ptr_'):
+        typename_without_ptr = typename[len('_ptr_'):]
+        if tif.get_named_type(typename_without_ptr):
+            return '*' + typename_without_ptr
+
+    # raise GoConvertFailedError(f'typename {typename} does not exist')
+    print(f'typename {typename} does not exist')
 
 def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name/ etc...
     if ast_type["NodeType"] != 'StructType':
@@ -77,8 +149,7 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
     
     fields = ast_type["Fields"]["List"]
     if not fields: # struct {}
-        names_and_types = []
-    else:
+        fields = []
     
     names_and_types = []
 
@@ -89,7 +160,7 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
             # TODO: if it's SelectorExpr 
             # -> we need to search for the struct name in the whole database
             if name["NodeType"] != "Ident": 
-                raise GoConvertFailedError(f"create_struct: unhandled: {field['Names'][i]['NodeType'] = }")
+                raise GoConvertFailedError(f"make_new_struct: unhandled: {field['Names'][i]['NodeType'] = }")
             
             names_and_types.append((name["Name"], field_type))
 
@@ -103,30 +174,100 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
         names_and_types[0][1] == 'uintptr' 
     )
 
-    return ""
+    import os
+    struct_typename = f"MyStruct_{os.urandom(4).hex()}"
 
-def get_type(ast_type, **ctx):
+    tif = ida_typeinf.tinfo_t()
+    udt = ida_typeinf.udt_type_data_t()
+    tif.create_udt(udt)
+    tif.set_named_type(None, struct_typename)
+
+    for varname, typename in names_and_types:
+        udm = ida_typeinf.udm_t()
+        udm.name = varname
+        udm.offset = tif.get_unpadded_size() * 8
+        udm.type = ida_typeinf.tinfo_t(typename)
+        udm.size = udm.type.get_size() * 8
+        tif.add_udm(udm)
+
+    # According to docs (if i'm correct) then each argument
+    # must be passed entirely in stack or in registers.
+    if is_likely_closure:
+        ok, udm0 = tif.get_udm(names_and_types[0][0])
+
+        udm0_funcdef = "void* (__usercall *)"
+        udm0_funcdef += "("
+
+        # I hate IDA documents :(
+        # don't know how to use argloc_t :<<
+        curr_reg = None
+        udm0_funcargs = []
+        for varname, typename in names_and_types:
+            # typedef = "void (__usercall *F)(_ptr_peer_Conn@<rax>, void *@<rdx>)"
+            udm0_funcargs.append(f'{typename} {varname}@<>')
+
+
+
+        udm0_funcdef += ")"
+
+
+
+    print(f'Created struct {struct_typename}')
+
+    return struct_typename
+
+def make_new_closure_struct(ast_type, **ctx) -> str:
+    if ast_type["NodeType"] != "FuncType":
+        return ""
+    
+    fields = ast_type["Params"]["List"]
+    if not fields:
+        fields = []
+
+    i_anonvar = 0  # if unknown variable name, set it to anon_xxx
+    names_and_types = []
+
+    for field in fields:
+        field_type = get_type(field["Type"])
+
+        if field["Names"] == None:
+            names_and_types.append((f'anon_{i_anonvar}', field_type))
+            i_anonvar += 1
+            continue
+
+        for i, name in enumerate(field["Names"]):
+            if name["NodeType"] != "Ident": 
+                raise GoConvertFailedError(f"make_new_closure_struct: unhandled: {field['Names'][i]['NodeType'] = }")
+            names_and_types.append((name["Name"], field_type))
+
+    print('closure:', names_and_types) 
+
+
+def get_type(ast_type, **ctx) -> str:
     node_type = ast_type["NodeType"]
 
+    if node_type == "StructType":
+        return make_new_struct(ast_type, **ctx)
+    
+    if node_type == "FuncType":
+        return make_new_closure_struct(ast_type, **ctx)
+
     if node_type == "StarExpr":
-        return '_ptr_' + get_type(ast_type["X"], **ctx)
+        return idb_type('_ptr_' + get_type(ast_type["X"], **ctx))
     
     if node_type == "Ident":
-        return ast_type["Name"]
+        return idb_type(ast_type["Name"])
 
     if node_type == "SelectorExpr":
-        return ast_type["X"]["Name"] + "_" + ast_type["Sel"]["Name"]
+        return idb_type(ast_type["X"]["Name"] + "_" + ast_type["Sel"]["Name"])
 
     if node_type == "ChanType":
         if ast_type["Dir"] == "SEND":
-            return "_chan_left_chan_" + get_type(ast_type["Value"], **ctx)
+            return idb_type("_chan_left_chan_" + get_type(ast_type["Value"], **ctx))
         if ast_type["Dir"] == "RECV":
-            return "chan_chan_left__" + get_type(ast_type["Value"], **ctx) # this is me bullshiting...
+            return idb_type("chan_chan_left__" + get_type(ast_type["Value"], **ctx)) # this is me bullshiting...
         if ast_type["Dir"] == "BOTH":
-            return "chan_" + get_type(ast_type["Value"], **ctx)
-        
-    if node_type == "StructType":
-        return make_new_struct(ast_type, **ctx)
+            return idb_type("chan_" + get_type(ast_type["Value"], **ctx))
 
     raise GoConvertFailedError(f"get_simple_type: unhandled {ast_type['NodeType'] = }")
 
@@ -247,4 +388,7 @@ if __name__ == '__main__':
         exit(-1)
 
     ast_type = get_typedef_ast(rtype_str.decode())
-    get_struct_type(ast_type)
+    try:
+        print(get_type(ast_type))
+    except Exception as e:
+        print("Dumped JSON:", json.dumps(ast_type, indent=4), f"Error: {e}", end='\n')
