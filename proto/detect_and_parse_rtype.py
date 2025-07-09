@@ -452,16 +452,13 @@ def extract_type_runtime_new_object(
     arg_item: idaapi.cexpr_t
 ):
     if not arg_item:
-        print("cannot extract argument item from function!")
-        return
+        throw("cannot extract argument item from function")
     if not arg_item.obj_ea:
-        print("cannot extract argument EA from function!")
-        return
+        throw("cannot extract argument EA from function")
     
     rodata_segm = idaapi.get_segm_by_name('.rodata')
     if not rodata_segm:
-        print("cannot extract .rodata details!")
-        return
+        throw("cannot extract .rodata details")
 
     # Need to find a way to detect this....
     is_little_endian = True
@@ -473,8 +470,7 @@ def extract_type_runtime_new_object(
     rtype_stroff = idc.get_bytes(rtype_stroff_addr, get_size)
 
     if rtype_stroff == None:
-        print("Cannot get stroff from RTYPE!")
-        return
+        throw("cannot get stroff from RTYPE")
 
     rtype_stroff = int.from_bytes(rtype_stroff, endianness)
     rtype_str_addr = rodata_segm.start_ea + rtype_stroff
@@ -482,8 +478,7 @@ def extract_type_runtime_new_object(
     # Not sure if it takes 2 bytes...?
     rtype_str_size = idc.get_bytes(rtype_str_addr + 1, 1)
     if rtype_str_size == None:
-        print("Cannot get str size from RTYPE!")
-        return
+        throw("cannot get str size from RTYPE")
     
     rtype_str_size = rtype_str_size[0]
     rtype_str = idc.get_bytes(rtype_str_addr + 2, rtype_str_size)
