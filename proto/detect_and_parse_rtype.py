@@ -16,8 +16,6 @@ from typing import NoReturn
 
 if idaapi.IDA_SDK_VERSION < 900:
     raise ValueError("Sorry. Current version not supported: IDA_SDK_VERSION = %d < 900" % idaapi.IDA_SDK_VERSION)
-if ida_ida.inf_get_procname() != "metapc" and ida_ida.inf_is_64bit():
-    raise ValueError("Sorry. Current method detection only works for x64 binaries: " + ida_ida.inf_get_procname())
 
 class GoConvertFailedError(Exception):
     pass
@@ -121,7 +119,12 @@ def get_closure_ctx_reg():
 def idb_type(typename: str):
     # Simple type resolves
     if typename == "int":
-        typename = "int64"
+        BITS = get_procinfo()[1]
+        if BITS == 64:
+            typename = "int64"
+        elif BITS == 32:
+            typename = "int32"
+            
     if typename == "byte":
         typename = "uint8"
 
