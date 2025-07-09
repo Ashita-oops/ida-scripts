@@ -8,8 +8,11 @@ import json
 import os
 import re
 import traceback
+import inspect
+import pathlib
 
 from collections import namedtuple
+from typing import NoReturn
 
 if idaapi.IDA_SDK_VERSION < 900:
     raise ValueError("Sorry. Current version not supported: IDA_SDK_VERSION = %d < 900" % idaapi.IDA_SDK_VERSION)
@@ -19,11 +22,20 @@ if ida_ida.inf_get_procname() != "metapc" and ida_ida.inf_is_64bit():
 class GoConvertFailedError(Exception):
     pass
 
+def throw(msg: str) -> NoReturn:
+    context = ""
+
+    frame = inspect.currentframe()
+    if frame and frame.f_back:
+        context = frame.f_back.f_code.co_name
+    
+    raise GoConvertFailedError(f"{context}: {msg}")
+
 # =========================================================================
 #       Golang AST generator
 # =========================================================================
 
-GO_PARSE_EXE = "C:\\Users\\null\\Documents\\go_ast\\main.exe"
+GO_PARSE_EXE = str(pathlib.Path.home()) + "\\Documents\\go_ast\\main.exe"
 
 def interact_with_process(command, input_data):
     process = subprocess.Popen(
@@ -41,16 +53,16 @@ def interact_with_process(command, input_data):
         stdout, stderr = process.communicate(input=input_data, timeout=10)
     except subprocess.TimeoutExpired:
         process.kill()
-        raise GoConvertFailedError(f"Go AST parser {GO_PARSE_EXE} timed out after 10 seconds")
+        throw(f"Go AST parser {GO_PARSE_EXE} timed out after 10 seconds")
         
     if process.returncode != 0:
-        raise GoConvertFailedError(f"Go AST parser {GO_PARSE_EXE} returned with code {process.returncode}")
+        throw(f"Go AST parser {GO_PARSE_EXE} returned with code {process.returncode}")
 
     return stdout, stderr
     
 def get_go_ast(go_src):
     if not os.path.exists(GO_PARSE_EXE):
-        raise GoConvertFailedError(f"Go AST parser \"{GO_PARSE_EXE}\" not found")
+        throw(f"Go AST parser \"{GO_PARSE_EXE}\" not found")
     
     stdout, stderr = interact_with_process(
                         GO_PARSE_EXE, json.dumps({
@@ -59,7 +71,7 @@ def get_go_ast(go_src):
 
     result = json.loads(stdout)
     if result["status"] != 0:
-        raise GoConvertFailedError(result["error"] + f"\n   on {go_src}")
+        throw(result["error"] + f"\n   on {go_src}")
     return result["result"]
 
 def get_typedef_ast(typedef: str):
@@ -75,7 +87,7 @@ def get_typedef_ast(typedef: str):
     try:
         return result["Decls"][0]["Specs"][0]["Type"]     # shortcut :)
     except Exception as e:
-        raise GoConvertFailedError("get_typedef_ast unhandled error: " + e.str())
+        throw(f"get_typedef_ast unhandled error: {e}")
     
 # =========================================================================
 #       Golang parser
@@ -103,12 +115,15 @@ def get_procinfo():
 def get_closure_ctx_reg():
     procinfo = get_procinfo()
     if procinfo not in REG_MAPS:
-        raise GoConvertFailedError(f"closure context register not defined for architecture {procinfo}")
+        throw(f"closure context register not defined for architecture {procinfo}")
     return REG_MAPS[procinfo].closure_ctx
 
 def idb_type(typename: str):
+    # Simple type resolves
     if typename == "int":
-        typename = "int64" # depends on machine :v
+        typename = "int64"
+    if typename == "byte":
+        typename = "uint8"
 
     # NOTE: do a fuzzy finder here if 
     # direct search doesn't yield a result :)
@@ -124,40 +139,14 @@ def idb_type(typename: str):
     if typename.startswith('_ptr_'):
         typename_without_ptr = typename[len('_ptr_'):]
         if tif.get_named_type(typename_without_ptr):
-            return '*' + typename_without_ptr
+            return typename_without_ptr + '*'
 
-    # raise GoConvertFailedError(f'typename {typename} does not exist')
+    # throw(f'typename {typename} does not exist')
     print(f'typename {typename} does not exist')
 
-def create_struct_from_strtypes(
-    names_and_types: list[tuple[str, str]], 
-    struct_typename: str | None = None,
-    existing_tif: ida_typeinf.tinfo_t = None,
-) -> ida_typeinf.tinfo_t:
-    
-    if existing_tif:
-        tif = existing_tif
-    else:
-        tif = ida_typeinf.tinfo_t()
-    
-    udt = ida_typeinf.udt_type_data_t()
-    tif.create_udt(udt)
-    if struct_typename:
-        tif.set_named_type(None, struct_typename)
-
-    for varname, typename in names_and_types:
-        udm = ida_typeinf.udm_t()
-        udm.name = varname
-        udm.offset = tif.get_unpadded_size() * 8
-        udm.type = ida_typeinf.tinfo_t(typename)
-        udm.size = udm.type.get_size() * 8
-        tif.add_udm(udm)
-
-    return tif
-
 def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name/ etc...
-    if ast_type["NodeType"] != 'StructType':
-        return ""
+    if ast_type["NodeType"] != "StructType":
+        throw(f"{ast_type['NodeType'] = } != \"StructType\"")
     
     fields = ast_type["Fields"]["List"]
     if not fields: # struct {}
@@ -172,7 +161,7 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
             # TODO: if it's SelectorExpr 
             # -> we need to search for the struct name in the whole database
             if name["NodeType"] != "Ident": 
-                raise GoConvertFailedError(f"make_new_struct: unhandled: {field['Names'][i]['NodeType'] = }")
+                throw(f"unhan {field['Names'][i]['NodeType'] = }")
             
             field_names_and_types.append((name["Name"], field_type))
 
@@ -187,35 +176,66 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
     )
 
     struct_typename = f"MyStruct_{os.urandom(4).hex()}"
-    tif = create_struct_from_strtypes(
-            field_names_and_types,
-            struct_typename        
-          )
+    struct_tif = ida_typeinf.tinfo_t()
+    udt = ida_typeinf.udt_type_data_t()
+    if not struct_tif.create_udt(udt):
+        throw("create_udt failed")
+    struct_tif.set_named_type(None, struct_typename)
+    
+    for varname, typename in field_names_and_types:
+        udm = ida_typeinf.udm_t()
+        udm.name = varname
+        udm.offset = struct_tif.get_size() * 8
+        udm.type = ida_typeinf.tinfo_t(typename)
+        udm.size = udm.type.get_size() * 8
+        struct_tif.add_udm(udm)
 
-    if is_likely_closure:
-        ok, udm0 = tif.get_udm(field_names_and_types[0][0])
+    print(f'Created struct {struct_typename}, {is_likely_closure = }')
 
-        # Make a func :)
+    # Not suspected closure, nothing else to be done....
+    if not is_likely_closure:
+        return struct_typename
+        
+    funcinfo = ida_typeinf.func_type_data_t()
+    funcinfo.rettype.create_simple_type(idaapi.BT_VOID) # return type is unknown so let's set it to void
+    for varname, typename in field_names_and_types[1:]:
+        funcarg = ida_typeinf.funcarg_t()
+        funcarg.name = varname
+        funcarg.type = ida_typeinf.tinfo_t(typename)
+        funcinfo.push_back(funcarg)
+        
+    # Resolve arguments into registers
+    # in Golang-style
+    funcinfo.cc = ida_typeinf.CM_CC_GOLANG
+    processor = ida_idp.get_ph()
+    if (retval := processor.calc_arglocs(funcinfo)) != 1:
+        throw(f'is_likely_closure: calc_arglocs failed: {retval = }')
 
-        udm0_funcdef = "void* (__usercall *)"
-        udm0_funcdef += "("
+    # Change back to custom calling to
+    # add closure context register :)
+    funcinfo.cc = ida_typeinf.CM_CC_SPECIAL
+    
+    # Add closure context register to functype
+    func_closure_arg = ida_typeinf.funcarg_t()
+    func_closure_arg.name = "CTX"
+    func_closure_arg.type.create_ptr(struct_tif)
+    func_closure_arg.argloc.set_reg1(idaapi.str2reg(get_closure_ctx_reg()))
+    funcinfo.push_back(func_closure_arg)
+    
+    functype = idaapi.tinfo_t()
+    if not functype.create_func(funcinfo):
+        throw("is_likely_closure: create_func failed")
 
-        # I hate IDA documents :(
-        # don't know how to use argloc_t :<<
-        curr_reg = None
-        udm0_funcargs = []
-        for varname, typename in field_names_and_types:
-            # typedef = "void (__usercall *F)(_ptr_peer_Conn@<rax>, void *@<rdx>)"
-            udm0_funcargs.append(f'{typename} {varname}@<>')
-        udm0_funcdef += ")"
-
-    print(f'Created struct {struct_typename}')
+    # Set F as func pointer :)
+    ptrfntype = idaapi.tinfo_t()
+    ptrfntype.create_ptr(functype)
+    struct_tif.set_udm_type(0, ptrfntype)
 
     return struct_typename
 
 def make_new_closure_struct(ast_type, **ctx) -> str:
     if ast_type["NodeType"] != "FuncType":
-        return ""
+        throw(f"{ast_type['NodeType'] = } != \"FuncType\"")
     
     fields = []
     if ast_type["Params"] and ast_type["Params"]["List"]:
@@ -239,7 +259,7 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
 
         for i, name in enumerate(field["Names"]):
             if name["NodeType"] != "Ident": 
-                raise GoConvertFailedError(f"make_new_closure_struct: unhandled: {field['Names'][i]['NodeType'] = }")
+                throw(f"unhandled: {field['Names'][i]['NodeType'] = }")
             arg_names_and_types.append((name["Name"], field_type))
 
     # We do the same for return type
@@ -257,65 +277,81 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
         funcarg.type = ida_typeinf.tinfo_t(typename)
         funcinfo.push_back(funcarg)
 
-    udt = ida_typeinf.udt_type_data_t()
-    funcinfo.rettype.create_udt(udt)
+    print(f'debug: {ret_names_and_types = }')
+    
+    if len(ret_names_and_types) == 0:
+        funcinfo.rettype.create_simple_type(idaapi.BT_VOID)
+    
+    elif len(ret_names_and_types) == 1:
+        funcinfo.rettype.get_named_type(None, ret_names_and_types[0][1])
+    
+    else:   # make struct when there's more than 1 return value :')
+        udt = ida_typeinf.udt_type_data_t()
+        if not funcinfo.rettype.create_udt(udt):
+            throw(f'funcinfo.rettype.create_udt failed')
 
-    for varname, typename in arg_names_and_types:
-        udm = ida_typeinf.udm_t()
-        udm.name = varname
-        udm.offset = funcinfo.rettype.get_unpadded_size() * 8
-        udm.type = ida_typeinf.tinfo_t(typename)
-        udm.size = udm.type.get_size() * 8
-        funcinfo.rettype.add_udm(udm)
+        funcinfo_rettype_structname = f'MyStruct_{os.urandom(4).hex()}'
+        funcinfo.rettype.set_named_type(None, funcinfo_rettype_structname)
+        print(f'Created struct {funcinfo_rettype_structname}')
 
+        for varname, typename in ret_names_and_types:
+            udm = ida_typeinf.udm_t()
+            udm.name = varname
+            udm.offset = funcinfo.rettype.get_size() * 8
+            udm.type = ida_typeinf.tinfo_t(typename)
+            udm.size = udm.type.get_size() * 8
+            funcinfo.rettype.add_udm(udm)
+        
     # Resolve arguments into registers
     # in Golang-style
     funcinfo.cc = ida_typeinf.CM_CC_GOLANG
     processor = ida_idp.get_ph()
     if (retval := processor.calc_arglocs(funcinfo)) != 1:
-        raise GoConvertFailedError(f'make_new_closure_struct: calc_arglocs failed: {retval = }')
-    if (retval := processor.calc_retloc(funcinfo.retloc, funcinfo.rettype, ida_typeinf.CM_CC_GOLANG)) != 1:
-        raise GoConvertFailedError(f'make_new_closure_struct: calc_retloc failed: {retval = }')
+        throw(f'calc_arglocs failed: {retval = }')
+    if len(ret_names_and_types):
+        if (retval := processor.calc_retloc(funcinfo.retloc, funcinfo.rettype, ida_typeinf.CM_CC_GOLANG)) != 1:
+            throw(f'calc_retloc failed: {retval = }')
 
     # Change back to custom calling to
     # add closure context register :)
     funcinfo.cc = ida_typeinf.CM_CC_SPECIAL
 
-    # Create closure object
     closure_struct_typename = f"MyStruct_{os.urandom(4).hex()}"
-
-    tif = ida_typeinf.tinfo_t()
+    
+    # Create closure object
+    closure_tif = ida_typeinf.tinfo_t()
     udt = ida_typeinf.udt_type_data_t()
-    tif.create_udt(udt)
-    if closure_struct_typename:
-        tif.set_named_type(None, closure_struct_typename)
-
+    if not closure_tif.create_udt(udt):
+        throw(f'create_udt failed')
+    
+    closure_tif.set_named_type(None, closure_struct_typename)
+    print(f'Created struct {closure_struct_typename}')
+    
     for varname, typename in [('F', idb_type("uintptr"))] + arg_names_and_types:
         udm = ida_typeinf.udm_t()
         udm.name = varname
-        udm.offset = tif.get_unpadded_size() * 8
+        udm.offset = closure_tif.get_size() * 8
         udm.type = ida_typeinf.tinfo_t(typename)
         udm.size = udm.type.get_size() * 8
-        tif.add_udm(udm)
-
-    tif_closure = tif
+        closure_tif.add_udm(udm)
 
     # Add closure context register to functype
     func_closure_arg = ida_typeinf.funcarg_t()
-    func_closure_arg.name = "closure_ctx"
-    func_closure_arg.type.create_ptr(tif_closure)
+    func_closure_arg.name = "CTX"
+    func_closure_arg.type.create_ptr(closure_tif)
     func_closure_arg.argloc.set_reg1(idaapi.str2reg(get_closure_ctx_reg()))
     funcinfo.push_back(func_closure_arg)
 
     functype = idaapi.tinfo_t()
     if not functype.create_func(funcinfo):
-        raise GoConvertFailedError("make_new_closure_struct: create_func failed")
+        throw("create_func failed")
 
     # Set F as func pointer :)
     ptrfntype = idaapi.tinfo_t()
     ptrfntype.create_ptr(functype)
-    tif_closure.set_udm_type(0, ptrfntype)
-
+    closure_tif.set_udm_type(0, ptrfntype)
+    
+    return closure_struct_typename + '*'
 
 def resolve_type(ast_type, **ctx) -> str:
     node_type = ast_type["NodeType"]
@@ -343,7 +379,7 @@ def resolve_type(ast_type, **ctx) -> str:
         if ast_type["Dir"] == "BOTH":
             return idb_type("chan_" + resolve_type(ast_type["Value"], **ctx))
 
-    raise GoConvertFailedError(f"get_simple_type: unhandled {ast_type['NodeType'] = }")
+    throw(f"unhandled {ast_type['NodeType'] = }")
 
 # =========================================================================
 #       IDA C-tree parser
@@ -454,20 +490,34 @@ def extract_type_runtime_new_object(
     return rtype_str
 
 if __name__ == '__main__':
-    # ret_item, call_item, arg_item = get_ctree_item(idaapi.get_screen_ea())
-
-    # rtype_str = extract_type_runtime_new_object(ret_item, call_item, arg_item)
-    # if not rtype_str:
-    #     print("what the f")
-    #     exit(-1)
-
-    # ast_type = get_typedef_ast(rtype_str.decode())
-    ast_type = get_typedef_ast("func (int, int) (int, int)")
+    rtype_str = None
+    ast_type  = None
+    
     try:
-        print(resolve_type(ast_type))
-    except Exception as e:
-        print("Dumped JSON:")
-        print(json.dumps(ast_type, indent=4))
-        print("\nDetailed traceback:")
-        # Print formatted traceback with file name and line numbers
+        ret_item, call_item, arg_item = get_ctree_item(idaapi.get_screen_ea())
+
+        rtype_str = extract_type_runtime_new_object(ret_item, call_item, arg_item)
+        if not rtype_str:
+            throw("cannot extract type runtime new object")
+            
+        ast_type = get_typedef_ast(rtype_str.decode())
+        print('Resolve:', resolve_type(ast_type))
+
+    except GoConvertFailedError as e:
+        if rtype_str is not None:
+            print(" Dumped rtype_str: ".center(80, '-'))
+            print(json.dumps(ast_type, indent=4))
+            print("-" * 80)
+        
+        # if ast_type:
+        #     print(" Dumped JSON: ".center(80, '-'))
+        #     print(json.dumps(ast_type, indent=4))
+        #     print("\n" + "-" * 80)
+            
+        print()
+        print(" Detailed traceback: ".center(80, '-'))
+        print()
         traceback.print_exc()
+        print("\n" + "-" * 80)
+        
+        
