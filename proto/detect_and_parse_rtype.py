@@ -124,8 +124,10 @@ def idb_type(typename: str):
             typename = "int64"
         elif BITS == 32:
             typename = "int32"
-            
-    if typename == "byte":
+    elif typename == "byte":
+        typename = "uint8"
+        
+    elif typename == "bool":
         typename = "uint8"
 
     # NOTE: do a fuzzy finder here if 
@@ -178,41 +180,39 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
         field_names_and_types[0][1] == 'uintptr' 
     )
 
-    struct_typename = f"MyStruct_{os.urandom(4).hex()}"
-    struct_tif = ida_typeinf.tinfo_t()
     udt = ida_typeinf.udt_type_data_t()
-    if not struct_tif.create_udt(udt):
-        throw("create_udt failed")
-    struct_tif.set_named_type(None, struct_typename)
-    
     for varname, typename in field_names_and_types:
         udm = ida_typeinf.udm_t()
         udm.name = varname
-        udm.offset = struct_tif.get_size() * 8
         udm.type = ida_typeinf.tinfo_t(typename)
-        udm.size = udm.type.get_size() * 8
-        struct_tif.add_udm(udm)
+        udt.push_back(udm)
 
+    struct_tif = ida_typeinf.tinfo_t()
+    if not struct_tif.create_udt(udt):
+        throw("create_udt failed")
+
+    # Set typename
+    struct_typename = f"MyStruct_{os.urandom(4).hex()}"
+    struct_tif.set_named_type(None, struct_typename)
     print(f'Created struct {struct_typename}, {is_likely_closure = }')
 
-    # Not suspected closure, nothing else to be done....
     if not is_likely_closure:
-        return struct_typename
+       return struct_typename
         
     funcinfo = ida_typeinf.func_type_data_t()
     funcinfo.rettype.create_simple_type(idaapi.BT_VOID) # return type is unknown so let's set it to void
-    for varname, typename in field_names_and_types[1:]:
-        funcarg = ida_typeinf.funcarg_t()
-        funcarg.name = varname
-        funcarg.type = ida_typeinf.tinfo_t(typename)
-        funcinfo.push_back(funcarg)
+    # for varname, typename in field_names_and_types[1:]:
+    #     funcarg = ida_typeinf.funcarg_t()
+    #     funcarg.name = varname
+    #     funcarg.type = ida_typeinf.tinfo_t(typename)
+    #     funcinfo.push_back(funcarg)
         
     # Resolve arguments into registers
     # in Golang-style
-    funcinfo.cc = ida_typeinf.CM_CC_GOLANG
-    processor = ida_idp.get_ph()
-    if (retval := processor.calc_arglocs(funcinfo)) != 1:
-        throw(f'is_likely_closure: calc_arglocs failed: {retval = }')
+    # funcinfo.cc = ida_typeinf.CM_CC_GOLANG
+    # processor = ida_idp.get_ph()
+    # if (retval := processor.calc_arglocs(funcinfo)) != 1:
+    #     throw(f'is_likely_closure: calc_arglocs failed: {retval = }')
 
     # Change back to custom calling to
     # add closure context register :)
@@ -220,7 +220,7 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
     
     # Add closure context register to functype
     func_closure_arg = ida_typeinf.funcarg_t()
-    func_closure_arg.name = "CTX"
+    func_closure_arg.name = "closure_ctx"
     func_closure_arg.type.create_ptr(struct_tif)
     func_closure_arg.argloc.set_reg1(idaapi.str2reg(get_closure_ctx_reg()))
     funcinfo.push_back(func_closure_arg)
@@ -280,8 +280,6 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
         funcarg.type = ida_typeinf.tinfo_t(typename)
         funcinfo.push_back(funcarg)
 
-    print(f'debug: {ret_names_and_types = }')
-    
     if len(ret_names_and_types) == 0:
         funcinfo.rettype.create_simple_type(idaapi.BT_VOID)
     
@@ -290,20 +288,19 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
     
     else:   # make struct when there's more than 1 return value :')
         udt = ida_typeinf.udt_type_data_t()
-        if not funcinfo.rettype.create_udt(udt):
-            throw(f'funcinfo.rettype.create_udt failed')
-
-        funcinfo_rettype_structname = f'MyStruct_{os.urandom(4).hex()}'
-        funcinfo.rettype.set_named_type(None, funcinfo_rettype_structname)
-        print(f'Created struct {funcinfo_rettype_structname}')
-
         for varname, typename in ret_names_and_types:
             udm = ida_typeinf.udm_t()
             udm.name = varname
-            udm.offset = funcinfo.rettype.get_size() * 8
             udm.type = ida_typeinf.tinfo_t(typename)
-            udm.size = udm.type.get_size() * 8
-            funcinfo.rettype.add_udm(udm)
+            udt.push_back(udm)
+
+        if not funcinfo.rettype.create_udt(udt):
+            throw(f'funcinfo.rettype.create_udt failed')
+
+        # Set return typename
+        funcinfo_rettype_structname = f'MyStruct_{os.urandom(4).hex()}'
+        funcinfo.rettype.set_named_type(None, funcinfo_rettype_structname)
+        print(f'Created struct {funcinfo_rettype_structname}')
         
     # Resolve arguments into registers
     # in Golang-style
@@ -319,28 +316,29 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
     # add closure context register :)
     funcinfo.cc = ida_typeinf.CM_CC_SPECIAL
 
-    closure_struct_typename = f"MyStruct_{os.urandom(4).hex()}"
-    
+    # Add as struct with only ('F', 'uintptr'), the rest is unfinished 
+    # since we need a reference type to it :)
+    # If somehow we can know the rest, we can make it work :)
+    udt = ida_typeinf.udt_type_data_t()
+    for varname, typename in [('F', idb_type("uintptr"))]:
+        udm = ida_typeinf.udm_t()
+        udm.name = varname
+        udm.type = ida_typeinf.tinfo_t(typename)
+        udt.push_back(udm)
+
     # Create closure object
     closure_tif = ida_typeinf.tinfo_t()
-    udt = ida_typeinf.udt_type_data_t()
     if not closure_tif.create_udt(udt):
         throw(f'create_udt failed')
-    
+
+    # Set typename    
+    closure_struct_typename = f"MyStruct_{os.urandom(4).hex()}"
     closure_tif.set_named_type(None, closure_struct_typename)
     print(f'Created struct {closure_struct_typename}')
     
-    for varname, typename in [('F', idb_type("uintptr"))] + arg_names_and_types:
-        udm = ida_typeinf.udm_t()
-        udm.name = varname
-        udm.offset = closure_tif.get_size() * 8
-        udm.type = ida_typeinf.tinfo_t(typename)
-        udm.size = udm.type.get_size() * 8
-        closure_tif.add_udm(udm)
-
     # Add closure context register to functype
     func_closure_arg = ida_typeinf.funcarg_t()
-    func_closure_arg.name = "CTX"
+    func_closure_arg.name = "closure_ctx"
     func_closure_arg.type.create_ptr(closure_tif)
     func_closure_arg.argloc.set_reg1(idaapi.str2reg(get_closure_ctx_reg()))
     funcinfo.push_back(func_closure_arg)
@@ -517,5 +515,3 @@ if __name__ == '__main__':
         print()
         traceback.print_exc()
         print("\n" + "-" * 80)
-        
-        
