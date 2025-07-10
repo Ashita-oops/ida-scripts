@@ -116,19 +116,30 @@ def get_closure_ctx_reg():
         throw(f"closure context register not defined for architecture {procinfo}")
     return REG_MAPS[procinfo].closure_ctx
 
-def idb_type(typename: str):
+def ida_type(typename: str):
     # Simple type resolves
     if typename == "int":
         BITS = get_procinfo()[1]
         if BITS == 64:
             typename = "int64"
         elif BITS == 32:
-            typename = "int32"
+            typename = "int32" # guessing
+
+    elif typename == "uint":
+        BITS = get_procinfo()[1]
+        if BITS == 64:
+            typename = "uint64"
+        elif BITS == 32:
+            typename = "uint32" # guessing
+
     elif typename == "byte":
         typename = "uint8"
         
     elif typename == "bool":
         typename = "uint8"
+
+    elif typename == "any":
+        typename = "interface_"
 
     # NOTE: do a fuzzy finder here if 
     # direct search doesn't yield a result :)
@@ -320,7 +331,7 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
     # since we need a reference type to it :)
     # If somehow we can know the rest, we can make it work :)
     udt = ida_typeinf.udt_type_data_t()
-    for varname, typename in [('F', idb_type("uintptr"))]:
+    for varname, typename in [('F', ida_type("uintptr"))]:
         udm = ida_typeinf.udm_t()
         udm.name = varname
         udm.type = ida_typeinf.tinfo_t(typename)
@@ -364,21 +375,30 @@ def resolve_type(ast_type, **ctx) -> str:
         return make_new_closure_struct(ast_type, **ctx)
 
     if node_type == "StarExpr":
-        return idb_type('_ptr_' + resolve_type(ast_type["X"], **ctx))
+        return ida_type('_ptr_' + resolve_type(ast_type["X"], **ctx))
     
     if node_type == "Ident":
-        return idb_type(ast_type["Name"])
+        return ida_type(ast_type["Name"])
 
     if node_type == "SelectorExpr":
-        return idb_type(ast_type["X"]["Name"] + "_" + ast_type["Sel"]["Name"])
+        return ida_type(ast_type["X"]["Name"] + "_" + ast_type["Sel"]["Name"])
 
     if node_type == "ChanType":
         if ast_type["Dir"] == "SEND":
-            return idb_type("_chan_left_chan_" + resolve_type(ast_type["Value"], **ctx))
+            return ida_type("_chan_left_chan_" + resolve_type(ast_type["Value"], **ctx))
         if ast_type["Dir"] == "RECV":
-            return idb_type("chan_chan_left__" + resolve_type(ast_type["Value"], **ctx)) # this is me bullshiting...
+            return ida_type("chan_chan_left__" + resolve_type(ast_type["Value"], **ctx)) # this is me bullshiting...
         if ast_type["Dir"] == "BOTH":
-            return idb_type("chan_" + resolve_type(ast_type["Value"], **ctx))
+            return ida_type("chan_" + resolve_type(ast_type["Value"], **ctx))
+        
+    if node_type == "ArrayType":
+        return ida_type("_slice_" + resolve_type(ast_type["Elt"]))
+
+    if node_type == "InterfaceType":
+        return ida_type("interface_")
+    
+    if node_type == "MapType":
+        return ida_type("map_" + resolve_type(ast_type["Key"]) + "_" + resolve_type(ast_type["Value"]))
 
     throw(f"unhandled {ast_type['NodeType'] = }")
 
@@ -499,16 +519,16 @@ if __name__ == '__main__':
         ast_type = get_typedef_ast(rtype_str.decode())
         print('Resolve:', resolve_type(ast_type))
 
-    except GoConvertFailedError as e:
+    except Exception as e:
         if rtype_str is not None:
             print(" Dumped rtype_str: ".center(80, '-'))
-            print(json.dumps(ast_type, indent=4))
+            print(rtype_str)
             print("-" * 80)
         
-        # if ast_type:
-        #     print(" Dumped JSON: ".center(80, '-'))
-        #     print(json.dumps(ast_type, indent=4))
-        #     print("\n" + "-" * 80)
+        if ast_type:
+            print(" Dumped JSON: ".center(80, '-'))
+            print(json.dumps(ast_type, indent=4))
+            print("\n" + "-" * 80)
             
         print()
         print(" Detailed traceback: ".center(80, '-'))
