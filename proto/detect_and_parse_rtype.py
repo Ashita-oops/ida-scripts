@@ -157,6 +157,11 @@ def ida_type(typename: str):
         if tif.get_named_type(typename_without_ptr):
             return typename_without_ptr + '*'
 
+    # HACK: For types like chan with unknown type...
+    # it's likely to just return void*...
+    if typename.startswith('chan_'):
+        return "void*"
+
     # throw(f'typename {typename} does not exist')
     print(f'typename {typename} does not exist')
 
@@ -203,7 +208,7 @@ def make_new_struct(ast_type, **ctx) -> str: # ctx could be parent function name
         throw("create_udt failed")
 
     # Set typename
-    struct_typename = f"MyStruct_{os.urandom(4).hex()}"
+    struct_typename = f"mystru_{os.urandom(4).hex()}"
     struct_tif.set_named_type(None, struct_typename)
     print(f'Created struct {struct_typename}, {is_likely_closure = }')
 
@@ -309,7 +314,7 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
             throw(f'funcinfo.rettype.create_udt failed')
 
         # Set return typename
-        funcinfo_rettype_structname = f'MyStruct_{os.urandom(4).hex()}'
+        funcinfo_rettype_structname = f'mystru_{os.urandom(4).hex()}'
         funcinfo.rettype.set_named_type(None, funcinfo_rettype_structname)
         print(f'Created struct {funcinfo_rettype_structname}')
         
@@ -343,7 +348,7 @@ def make_new_closure_struct(ast_type, **ctx) -> str:
         throw(f'create_udt failed')
 
     # Set typename    
-    closure_struct_typename = f"MyStruct_{os.urandom(4).hex()}"
+    closure_struct_typename = f"mystru_{os.urandom(4).hex()}"
     closure_tif.set_named_type(None, closure_struct_typename)
     print(f'Created struct {closure_struct_typename}')
     
@@ -515,7 +520,7 @@ if __name__ == '__main__':
         rtype_str = extract_type_runtime_new_object(ret_item, call_item, arg_item)
         if not rtype_str:
             throw("cannot extract type runtime new object")
-            
+
         ast_type = get_typedef_ast(rtype_str.decode())
         print('Resolve:', resolve_type(ast_type))
 
